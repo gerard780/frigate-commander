@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from frigate_api import normalize_event_times
+from .frigate_api import normalize_event_times
 
 
 @dataclass(frozen=True)

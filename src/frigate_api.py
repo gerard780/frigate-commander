@@ -48,8 +48,8 @@ def _build_events_url(
     return f"{url}?{urllib.parse.urlencode(query)}"
 
 
-def _request_json(url: str) -> list[dict]:
-    with urllib.request.urlopen(url) as response:
+def _request_json(url: str, timeout: float | None = None) -> list[dict]:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
         payload = response.read().decode("utf-8")
     data = json.loads(payload)
     if not isinstance(data, list):
@@ -76,6 +76,7 @@ def fetch_animal_events(
     end_time: float | None = None,
     labels: Sequence[str] | None = None,
     limit: int = 100,
+    timeout: float | None = None,
 ) -> list[dict]:
     """Fetch events for the requested labels, camera, and time range.
 
@@ -86,16 +87,26 @@ def fetch_animal_events(
         end_time: Unix timestamp for the end of the window.
         labels: Optional labels to filter (defaults to common animal labels).
         limit: Max results per label request.
+        timeout: Optional timeout (seconds) for each request.
     """
+
+    if limit <= 0:
+        raise ValueError("limit must be greater than zero")
 
     labels_to_fetch = tuple(labels) if labels is not None else DEFAULT_ANIMAL_LABELS
     if not labels_to_fetch:
         raise ValueError("labels must contain at least one label")
 
-    events: list[dict] = []
+    normalized_labels = []
     for label in labels_to_fetch:
+        label_value = str(label).strip().lower()
+        if label_value and label_value not in normalized_labels:
+            normalized_labels.append(label_value)
+
+    events: list[dict] = []
+    for label in normalized_labels:
         url = _build_events_url(base_url, camera, start_time, end_time, label, limit)
-        events.extend(_request_json(url))
+        events.extend(_request_json(url, timeout=timeout))
 
     return _dedupe_events(events)
 
@@ -104,7 +115,7 @@ def filter_events_by_labels(
     events: Iterable[dict],
     labels: Sequence[str],
 ) -> list[dict]:
-    label_set = {label.lower() for label in labels}
+    label_set = {str(label).lower() for label in labels}
     filtered = []
     for event in events:
         label = str(event.get("label", "")).lower()
@@ -114,7 +125,9 @@ def filter_events_by_labels(
 
 
 def normalize_event_times(event: dict) -> tuple[float, float]:
-    start = float(event.get("start_time", 0.0))
-    end = event.get("end_time")
-    end_time = float(end) if end is not None else start
+    start = float(event.get("start_time") or event.get("start_timestamp") or 0.0)
+    end_value = event.get("end_time") or event.get("end_timestamp")
+    end_time = float(end_value) if end_value is not None else start
+    if end_time < start:
+        start, end_time = end_time, start
     return start, end_time
