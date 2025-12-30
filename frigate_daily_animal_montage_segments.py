@@ -61,12 +61,7 @@ class Config:
     # ---- VOD endpoint template (HLS) ----
     vod_url_template: str = "{base}/vod/{camera}/start/{start}/end/{end}/master.m3u8"
 
-    # ---- Default mode behavior ----
-    # User requested: default to copy/copy-audio for normal realtime exports
-    default_copy: bool = True
-    default_copy_audio: bool = True
-
-    # ---- NVENC settings (used when encoding) ----
+    # ---- NVENC settings (smaller output) ----
     fps: int = 20
     nvenc_preset: str = "p5"       # p5 ~ x264 medium
     nvenc_profile: str = "high"
@@ -120,11 +115,8 @@ def parse_args():
     p.add_argument("--latitude", type=float, default=CFG.latitude)
     p.add_argument("--longitude", type=float, default=CFG.longitude)
 
-    p.add_argument(
-        "--date",
-        default=None,
-        help="YYYY-MM-DD. Default: yesterday (local TZ). Used as base day for dawn/dusk windows."
-    )
+    p.add_argument("--date", default=None,
+                   help="YYYY-MM-DD. Default: yesterday (local TZ). Used as base day for dawn/dusk windows.")
 
     g = p.add_mutually_exclusive_group()
     g.add_argument("--dawntodusk", action="store_true",
@@ -142,22 +134,13 @@ def parse_args():
     # Output
     p.add_argument("--out-dir", default=CFG.out_dir)
 
-    # ---- Mode control ----
-    # Defaults (as requested) are copy+copy-audio, unless --timelapse is set.
-    p.add_argument("--copy", action="store_true", default=CFG.default_copy,
-                   help="Copy video stream (no re-encode). Default: ON for realtime exports.")
-    p.add_argument("--copy-audio", action="store_true", default=CFG.default_copy_audio,
-                   help="Copy audio stream. Default: ON for realtime exports.")
-    p.add_argument("--encode", action="store_true", default=False,
-                   help="Force encode mode (NVENC) even for realtime exports.")
+    # ---- Copy mode ----
+    p.add_argument("--copy", action="store_true",
+                   help="Copy video stream (no re-encode). Default in this mode: re-encode audio to AAC for reliability.")
+    p.add_argument("--copy-audio", action="store_true",
+                   help="With --copy, also attempt to copy audio (may fail if segments differ).")
 
-    # ---- Timelapse ----
-    p.add_argument("--timelapse", type=float, default=None,
-                   help="Speed-up factor (e.g. 25, 50, 100, 4.2). Applies setpts=PTS/X. Forces encode mode.")
-    p.add_argument("--timelapse-audio", action="store_true", default=False,
-                   help="When using --timelapse, keep audio and speed it up via atempo chaining (often not useful).")
-
-    # NVENC overrides (used when encoding)
+    # NVENC overrides (only used when NOT --copy)
     p.add_argument("--fps", type=int, default=CFG.fps)
     p.add_argument("--preset", default=CFG.nvenc_preset,
                    help="NVENC preset p1..p7 (p5 ~ x264 medium).")
@@ -167,7 +150,7 @@ def parse_args():
     p.add_argument("--bufsize", default=CFG.nvenc_bufsize)
     p.add_argument("--aq-strength", type=int, default=CFG.nvenc_aq_strength)
 
-    # Audio overrides (used when encoding audio)
+    # Audio overrides (used in encode mode, and in --copy mode unless --copy-audio)
     p.add_argument("--audio-bitrate", default=CFG.audio_bitrate)
     p.add_argument("--audio-channels", type=int, default=CFG.audio_channels)
 
@@ -281,37 +264,6 @@ def probe_vod_url(url: str) -> bool:
         return False
 
 
-def atempo_chain_for_speed(speed: float):
-    """
-    FFmpeg atempo supports 0.5..2.0. For big speedups like 25x, chain multiple atempo=2.0.
-    Returns a list of factors where each factor is within [0.5, 2.0] and product ~= speed.
-    """
-    if speed <= 0:
-        raise ValueError("speed must be > 0")
-    factors = []
-    remaining = speed
-
-    # Speedups > 2: repeatedly apply 2.0
-    while remaining > 2.0 + 1e-9:
-        factors.append(2.0)
-        remaining /= 2.0
-
-    # Now remaining in (0, 2]
-    if remaining < 0.5 - 1e-9:
-        # This would be slowdown too large; split into 0.5 chunks (not typical for timelapse)
-        while remaining < 0.5 - 1e-9:
-            factors.append(0.5)
-            remaining /= 0.5
-
-    # Add final factor if not ~1
-    if abs(remaining - 1.0) > 1e-9:
-        # Clamp just in case of floating error
-        remaining = max(0.5, min(2.0, remaining))
-        factors.append(remaining)
-
-    return factors
-
-
 def run_ffmpeg_concat_stdin(
     concat_text: bytes,
     out_mp4: str,
@@ -326,13 +278,10 @@ def run_ffmpeg_concat_stdin(
     audio_channels: int,
     copy_mode: bool,
     copy_audio: bool,
-    timelapse: float | None,
-    timelapse_audio: bool,
 ):
     os.makedirs(os.path.dirname(out_mp4) or ".", exist_ok=True)
     gop = int(CFG.gop_seconds) * int(fps)
 
-    # Base input
     cmd = [
         "ffmpeg", "-y",
         "-protocol_whitelist", "file,http,https,tcp,tls,pipe,fd,crypto",
@@ -340,14 +289,6 @@ def run_ffmpeg_concat_stdin(
         "-i", "-",  # concat list from stdin
     ]
 
-    # Timelapse forces encode mode (copy + setpts is fragile across concat/HLS)
-    if timelapse is not None:
-        if timelapse <= 0:
-            die("--timelapse must be > 0")
-        copy_mode = False
-        copy_audio = False  # default: drop audio unless timelapse_audio
-
-    # Video
     if copy_mode:
         # Fast / minimal CPU: copy video.
         cmd += ["-c:v", "copy"]
@@ -370,28 +311,16 @@ def run_ffmpeg_concat_stdin(
             "-g", str(gop),
         ]
 
-    # Filters for timelapse (video + optional audio)
-    if timelapse is not None:
-        cmd += ["-filter:v", f"setpts=PTS/{timelapse}"]
-
-    # Audio
-    if timelapse is not None and not timelapse_audio:
-        cmd += ["-an"]
+    # Audio handling
+    if copy_mode and copy_audio:
+        cmd += ["-c:a", "copy"]
     else:
-        if copy_mode and copy_audio:
-            cmd += ["-c:a", "copy"]
-        else:
-            cmd += [
-                "-c:a", "aac",
-                "-b:a", str(audio_bitrate),
-                "-ac", str(audio_channels),
-                "-ar", str(CFG.audio_rate),
-            ]
-
-        if timelapse is not None and timelapse_audio:
-            factors = atempo_chain_for_speed(float(timelapse))
-            atempo = ",".join([f"atempo={f:.6f}".rstrip("0").rstrip(".") for f in factors])
-            cmd += ["-filter:a", atempo]
+        cmd += [
+            "-c:a", "aac",
+            "-b:a", str(audio_bitrate),
+            "-ac", str(audio_channels),
+            "-ar", str(CFG.audio_rate),
+        ]
 
     cmd += ["-movflags", "+faststart", out_mp4]
 
@@ -409,43 +338,23 @@ def main():
 
     after, before, start_local, end_local, window_tag, base_day = compute_window(args, tz)
 
-    # Decide mode:
-    # - If --timelapse provided => encode mode forced
-    # - Else if --encode => encode
-    # - Else default copy/copy-audio (as requested)
-    if args.timelapse is not None:
-        copy_mode = False
-        copy_audio = False
-        mode_str = f"TIMELAPSE {args.timelapse}x (encode)"
-    elif args.encode:
-        copy_mode = False
-        copy_audio = False
-        mode_str = "ENCODE (forced)"
-    else:
-        copy_mode = bool(args.copy)
-        copy_audio = bool(args.copy_audio)
-        mode_str = f"COPY video={'yes' if copy_mode else 'no'} audio={'yes' if copy_audio else 'no'}"
-
     print(f"Camera:  {args.camera}")
     print(f"Window:  {start_local.isoformat()} -> {end_local.isoformat()} ({window_tag})")
     print(f"Epoch:   after={after} before={before}")
     print(f"Padding: pre={args.pre_pad}s post={args.post_pad}s merge_gap={args.merge_gap}s")
-    print(f"Mode:    {mode_str}")
-
-    if not copy_mode or args.timelapse is not None:
+    if args.copy:
+        print(f"Mode:    COPY video={'yes'} audio={'copy' if args.copy_audio else 'aac'}")
+    else:
         print(f"NVENC:   fps={args.fps} preset={args.preset} cq={args.cq} maxrate={args.maxrate} bufsize={args.bufsize} aq_strength={args.aq_strength} gop={CFG.gop_seconds}s")
-        if args.timelapse is not None:
-            print(f"TL:      {args.timelapse}x (video setpts=PTS/{args.timelapse}) audio={'yes (atempo chain)' if args.timelapse_audio else 'no'}")
-        else:
-            print(f"Audio:   bitrate={args.audio_bitrate} channels={args.audio_channels}")
+        print(f"Audio:   bitrate={args.audio_bitrate} channels={args.audio_channels}")
 
-    # Pull events
+    # Pull events for the computed window
     params = {"camera": args.camera, "after": after, "before": before, "limit": 5000}
     events = api_get(args.base_url, "/api/events", params=params)
     if not isinstance(events, list):
         die(f"Unexpected /api/events response: {type(events)}")
 
-    # Filter animals
+    # Filter to animals
     filtered = []
     seen_labels = {}
     for ev in events:
@@ -482,7 +391,7 @@ def main():
     print(f"Raw segments:       {len(segments)}")
     print(f"Merged segments:    {len(merged)}")
 
-    # Probe
+    # Probe VOD endpoint using first segment
     test_url = vod_url_for_segment(args.base_url, args.camera, merged[0][0], merged[0][1])
     print("Probe VOD URL:", test_url)
     if not probe_vod_url(test_url):
@@ -492,7 +401,7 @@ def main():
             "  /vod/<camera>/start/<start>/end/<end>/master.m3u8\n"
         )
 
-    # Concat list
+    # Build concat list via stdin (no temp files)
     lines = []
     total_seconds = 0
     for i, (s, e) in enumerate(merged, 1):
@@ -506,10 +415,7 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     day_stamp = base_day.isoformat()
-    suffix = window_tag
-    if args.timelapse is not None:
-        suffix += f"-timelapse{args.timelapse}x"
-    out_mp4 = os.path.join(args.out_dir, f"{args.camera}-animals-{day_stamp}-{suffix}.mp4")
+    out_mp4 = os.path.join(args.out_dir, f"{args.camera}-animals-{day_stamp}-{window_tag}.mp4")
 
     print(f"Total montage source time (merged): ~{total_seconds}s")
     print(f"Output: {out_mp4}")
@@ -525,10 +431,8 @@ def main():
         aq_strength=args.aq_strength,
         audio_bitrate=args.audio_bitrate,
         audio_channels=args.audio_channels,
-        copy_mode=copy_mode,
-        copy_audio=copy_audio,
-        timelapse=args.timelapse,
-        timelapse_audio=args.timelapse_audio,
+        copy_mode=args.copy,
+        copy_audio=args.copy_audio,
     )
     print("DONE:", out_mp4)
 
