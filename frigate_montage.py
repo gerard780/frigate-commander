@@ -69,6 +69,18 @@ def parse_args():
                    help="Minimum chapter length in seconds (default 300).")
     p.add_argument("--chapters-gap", type=int, default=300,
                    help="Merge chapters when gap is below this many seconds (default 300).")
+    p.add_argument("--classify", action="store_true", default=False,
+                   help="Use local model inference to label chapters.")
+    p.add_argument("--classifier-model", default="75eafa2f3843347dd8e431c1763a0fb8",
+                   help="Path to ONNX model.")
+    p.add_argument("--classifier-info", default="75eafa2f3843347dd8e431c1763a0fb8.json",
+                   help="Path to model info JSON.")
+    p.add_argument("--classifier-frames", type=int, default=3,
+                   help="Frames per segment to classify (default 3).")
+    p.add_argument("--classifier-threshold", type=float, default=0.25,
+                   help="Score threshold for accepting labels (default 0.25).")
+    p.add_argument("--classifier-provider", choices=["auto", "cuda", "cpu"], default="auto",
+                   help="ONNX Runtime provider preference (default auto).")
 
     # render mode
     p.add_argument("--copy", action="store_true", default=True)
@@ -100,6 +112,159 @@ def format_chapter_ts(seconds: int) -> str:
     m = (total % 3600) // 60
     s = total % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def load_model_info(info_path: str):
+    with open(info_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    width = int(data["width"])
+    height = int(data["height"])
+    input_shape = data.get("inputShape", "nchw")
+    pixel_format = data.get("pixelFormat", "rgb")
+    label_map = {int(k): v for k, v in data.get("labelMap", {}).items()}
+    return width, height, input_shape, pixel_format, label_map
+
+
+def init_ort_session(model_path: str, provider: str):
+    try:
+        import onnxruntime as ort
+    except Exception as e:
+        raise SystemExit(f"onnxruntime not available: {e}")
+
+    providers = []
+    if provider in ("auto", "cuda"):
+        try:
+            providers.append("CUDAExecutionProvider")
+        except Exception:
+            pass
+    providers.append("CPUExecutionProvider")
+    sess = ort.InferenceSession(model_path, providers=providers)
+    return sess
+
+
+def extract_frame_rgb(path: str, width: int, height: int, ts: float):
+    cmd = [
+        "ffmpeg",
+        "-v", "error",
+        "-ss", f"{ts}",
+        "-i", path,
+        "-frames:v", "1",
+        "-vf", f"scale={width}:{height}",
+        "-pix_fmt", "rgb24",
+        "-f", "rawvideo",
+        "-",
+    ]
+    raw = subprocess.check_output(cmd)
+    expected = width * height * 3
+    if len(raw) != expected:
+        return None
+    import numpy as np
+    return np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+
+
+def select_files_for_segment(files, frames):
+    if not files:
+        return []
+    if frames <= 1:
+        return [files[len(files) // 2]]
+    if len(files) == 1:
+        return [files[0]]
+    idxs = []
+    for i in range(frames):
+        idx = int(round(i * (len(files) - 1) / (frames - 1)))
+        if idx not in idxs:
+            idxs.append(idx)
+    return [files[i] for i in idxs]
+
+
+def parse_yolo_outputs(outputs, num_classes: int, threshold: float):
+    import numpy as np
+
+    if not outputs:
+        return []
+    arr = np.array(outputs[0])
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim == 3 and arr.shape[0] in (num_classes + 4, num_classes + 5):
+        arr = np.transpose(arr, (1, 0, 2))
+    if arr.ndim == 2 and arr.shape[0] in (num_classes + 4, num_classes + 5) and arr.shape[1] > arr.shape[0]:
+        arr = arr.T
+
+    preds = arr
+    results = []
+
+    if preds.ndim != 2:
+        return results
+
+    dim = preds.shape[1]
+    if dim == 6:
+        for row in preds:
+            score = float(row[4])
+            if score < threshold:
+                continue
+            results.append((int(row[5]), score))
+        return results
+
+    if dim == num_classes + 5:
+        for row in preds:
+            obj = float(row[4])
+            if obj <= 0:
+                continue
+            cls_scores = row[5:]
+            cls_id = int(np.argmax(cls_scores))
+            score = obj * float(cls_scores[cls_id])
+            if score >= threshold:
+                results.append((cls_id, score))
+        return results
+
+    if dim == num_classes + 4:
+        for row in preds:
+            cls_scores = row[4:]
+            cls_id = int(np.argmax(cls_scores))
+            score = float(cls_scores[cls_id])
+            if score >= threshold:
+                results.append((cls_id, score))
+        return results
+
+    return results
+
+
+def classify_segment(seg, sess, input_name, width, height, input_shape, pixel_format, label_map,
+                     frames: int, threshold: float):
+    src = seg["source"]
+    if src["type"] != "disk":
+        return None
+    files = src.get("files", [])
+    if not files:
+        return None
+
+    selected = select_files_for_segment(files, frames)
+    scores = {}
+
+    for path in selected:
+        frame = extract_frame_rgb(path, width, height, ts=0.5)
+        if frame is None:
+            continue
+        if pixel_format.lower() != "rgb":
+            # Model expects rgb; if not, skip conversion for now.
+            pass
+        import numpy as np
+        inp = frame.astype(np.float32) / 255.0
+        if input_shape.lower() == "nchw":
+            inp = np.transpose(inp, (2, 0, 1))
+        inp = np.expand_dims(inp, axis=0)
+        outputs = sess.run(None, {input_name: inp})
+        detections = parse_yolo_outputs(outputs, len(label_map), threshold)
+        for cls_id, score in detections:
+            label = label_map.get(cls_id)
+            if not label:
+                continue
+            scores[label] = scores.get(label, 0.0) + float(score)
+
+    if not scores:
+        return None
+
+    return max(scores.items(), key=lambda kv: kv[1])[0]
 
 
 def best_label_for_segment(seg_start: int, seg_end: int, events):
@@ -218,13 +383,12 @@ def build_segment_diagnostics(segments, events, tz, utc):
     return durations, diagnostics
 
 
-def build_chapters(segments, segment_durations, events, tz, utc, *, min_len: int, merge_gap: int):
+def build_chapters(segments, segment_durations, labels, tz, utc, *, min_len: int, merge_gap: int):
     chapters = []
     current = None
 
-    for seg, seg_duration in zip(segments, segment_durations):
+    for seg, seg_duration, label in zip(segments, segment_durations, labels):
         s = int(seg["start"]); e = int(seg["end"])
-        label = best_label_for_segment(s, e, events)
 
         if current is None:
             current = {
@@ -491,10 +655,39 @@ def main():
     offset = 0
     lines = []
     segment_durations, segment_debug = build_segment_diagnostics(manifest_segments, filtered, tz, utc)
+
+    labels = []
+    if args.classify:
+        width, height, input_shape, pixel_format, label_map = load_model_info(args.classifier_info)
+        sess = init_ort_session(args.classifier_model, args.classifier_provider)
+        input_name = sess.get_inputs()[0].name
+        for seg in manifest_segments:
+            label = classify_segment(
+                seg,
+                sess,
+                input_name,
+                width,
+                height,
+                input_shape,
+                pixel_format,
+                label_map,
+                frames=args.classifier_frames,
+                threshold=args.classifier_threshold,
+            )
+            if label is None:
+                label = best_label_for_segment(int(seg["start"]), int(seg["end"]), filtered)
+            labels.append(label)
+    else:
+        for seg in manifest_segments:
+            labels.append(best_label_for_segment(int(seg["start"]), int(seg["end"]), filtered))
+
+    for d, lbl in zip(segment_debug, labels):
+        d["chapter_label"] = lbl
+
     chapters = build_chapters(
         manifest_segments,
         segment_durations,
-        filtered,
+        labels,
         tz,
         utc,
         min_len=args.chapters_min,
@@ -530,7 +723,8 @@ def main():
             f.write(
                 f"#{i:02d} {d['start_local']} -> {d['end_local']} src={d['source']} files={d['files']} "
                 f"est={d['est']:.2f}s act={d['actual']:.2f}s diff={d['diff']:+.2f}s "
-                f"gap_prev={gap_prev}s pad_before={pad_before} pad_after={pad_after} labels=[{labels}]\n"
+                f"gap_prev={gap_prev}s pad_before={pad_before} pad_after={pad_after} "
+                f"chapter={d.get('chapter_label')} labels=[{labels}]\n"
             )
     print(f"Debug: {debug_path} entries={len(segment_debug)}")
 
