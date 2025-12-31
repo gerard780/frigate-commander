@@ -73,10 +73,24 @@ def label_is_animal(label: str) -> bool:
 def compute_window(args, tz: ZoneInfo):
     """
     Returns:
-      after_ts, before_ts, start_local_dt, end_local_dt, window_tag, base_day
+      after_ts, before_ts, start_local_dt, end_local_dt, window_tag, start_day, end_day
     """
     now_local = datetime.now(tz)
-    base_day = date_cls.fromisoformat(args.date) if args.date else (now_local - timedelta(days=1)).date()
+    start_day = date_cls.fromisoformat(args.start_date) if args.start_date else None
+    if start_day is None:
+        start_day = date_cls.fromisoformat(args.date) if args.date else (now_local - timedelta(days=1)).date()
+
+    if args.end_date:
+        end_day = date_cls.fromisoformat(args.end_date)
+    elif args.days:
+        if int(args.days) < 1:
+            raise SystemExit("days must be >= 1")
+        end_day = start_day + timedelta(days=int(args.days) - 1)
+    else:
+        end_day = start_day
+
+    if end_day < start_day:
+        raise SystemExit("end-date must be on or after start-date")
 
     if args.dawntodusk or args.dusktodawn:
         loc = LocationInfo(
@@ -87,19 +101,19 @@ def compute_window(args, tz: ZoneInfo):
             longitude=args.longitude,
         )
         if args.dusktodawn:
-            start_dt_local = dusk(loc.observer, date=base_day, tzinfo=tz)
-            end_dt_local = dawn(loc.observer, date=base_day + timedelta(days=1), tzinfo=tz)
+            start_dt_local = dusk(loc.observer, date=start_day, tzinfo=tz)
+            end_dt_local = dawn(loc.observer, date=end_day + timedelta(days=1), tzinfo=tz)
             window_tag = "dusktodawn"
         else:
-            start_dt_local = dawn(loc.observer, date=base_day, tzinfo=tz)
-            end_dt_local = dusk(loc.observer, date=base_day, tzinfo=tz)
+            start_dt_local = dawn(loc.observer, date=start_day, tzinfo=tz)
+            end_dt_local = dusk(loc.observer, date=end_day, tzinfo=tz)
             window_tag = "dawntodusk"
     else:
-        start_dt_local = datetime(base_day.year, base_day.month, base_day.day, 0, 0, 0, tzinfo=tz)
-        end_dt_local = start_dt_local + timedelta(days=1)
+        start_dt_local = datetime(start_day.year, start_day.month, start_day.day, 0, 0, 0, tzinfo=tz)
+        end_dt_local = datetime(end_day.year, end_day.month, end_day.day, 0, 0, 0, tzinfo=tz) + timedelta(days=1)
         window_tag = "fullday"
 
-    return int(start_dt_local.timestamp()), int(end_dt_local.timestamp()), start_dt_local, end_dt_local, window_tag, base_day
+    return int(start_dt_local.timestamp()), int(end_dt_local.timestamp()), start_dt_local, end_dt_local, window_tag, start_day, end_day
 
 
 def build_segments_from_events(events: List[Dict[str, Any]], window_after: int, window_before: int, pre_pad: int, post_pad: int, min_len: int):
@@ -156,6 +170,9 @@ def parse_args():
     p.add_argument("--longitude", type=float, default=CFG.longitude)
 
     p.add_argument("--date", default=None, help="YYYY-MM-DD (default: yesterday local)")
+    p.add_argument("--start-date", default=None, help="YYYY-MM-DD (overrides --date for multi-day)")
+    p.add_argument("--end-date", default=None, help="YYYY-MM-DD (end day inclusive)")
+    p.add_argument("--days", type=int, default=None, help="Number of days starting at start-date/date")
 
     g = p.add_mutually_exclusive_group()
     g.add_argument("--dawntodusk", action="store_true")
@@ -177,7 +194,7 @@ def main():
     args = parse_args()
     tz = ZoneInfo(args.timezone)
 
-    after, before, start_local, end_local, window_tag, base_day = compute_window(args, tz)
+    after, before, start_local, end_local, window_tag, start_day, end_day = compute_window(args, tz)
 
     params = {"camera": args.camera, "after": after, "before": before, "limit": args.limit}
     events = api_get(args.base_url, "/api/events", params=params, headers=CFG.headers)
@@ -212,7 +229,8 @@ def main():
         "base_url": args.base_url.rstrip("/"),
         "timezone": args.timezone,
         "window_tag": window_tag,
-        "base_day": base_day.isoformat(),
+        "base_day": start_day.isoformat(),
+        "base_day_end": end_day.isoformat(),
         "window": {
             "after": after,
             "before": before,
