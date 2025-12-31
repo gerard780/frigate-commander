@@ -63,11 +63,15 @@ def parse_args():
     p.add_argument("--encode", action="store_true", default=False)
     p.add_argument("--timelapse", type=float, default=None)
     p.add_argument("--timelapse-audio", action="store_true", default=False)
+    p.add_argument("--progress", action="store_true", default=False)
 
     # encode params
     p.add_argument("--fps", type=int, default=frigate_render.CFG.fps)
     p.add_argument("--preset", default="p5")
     p.add_argument("--cq", type=int, default=23)
+    p.add_argument("--encoder", default=frigate_render.CFG.default_encoder,
+                   choices=["h264_nvenc", "hevc_nvenc", "libx264", "libx265"])
+    p.add_argument("--crf", type=int, default=frigate_render.CFG.default_crf)
     p.add_argument("--maxrate", default="6M")
     p.add_argument("--bufsize", default="12M")
     p.add_argument("--aq-strength", type=int, default=8)
@@ -232,6 +236,10 @@ def main():
     print(f"Concat: {concat_path} entries={len(concat_entries)}")
     print(f"Output: {out_mp4}")
 
+    total_out_seconds = sum([int(s["end"]) - int(s["start"]) for s in manifest_segments])
+    if args.timelapse is not None:
+        total_out_seconds = total_out_seconds / float(args.timelapse)
+
     frigate_render.run_ffmpeg(
         concat_path,
         out_mp4,
@@ -241,12 +249,16 @@ def main():
         fps=args.fps,
         preset=args.preset,
         cq=args.cq,
+        encoder=args.encoder,
+        crf=args.crf,
         maxrate=args.maxrate,
         bufsize=args.bufsize,
         aq_strength=args.aq_strength,
         audio_bitrate=args.audio_bitrate,
         audio_channels=args.audio_channels,
         timelapse_audio=args.timelapse_audio,
+        progress=args.progress,
+        total_out_seconds=total_out_seconds,
     )
 
     print("DONE:", out_mp4)

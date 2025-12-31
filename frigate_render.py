@@ -36,6 +36,8 @@ class Config:
     nvenc_bv: str = "0"
     gop_seconds: int = 3
     audio_rate: int = 48000
+    default_encoder: str = "h264_nvenc"
+    default_crf: int = 19
 
 CFG = Config()
 
@@ -50,6 +52,67 @@ def atempo_chain_for_speed(speed: float):
         remaining = max(0.5, min(2.0, remaining))
         factors.append(remaining)
     return factors
+
+
+def format_duration(seconds: float) -> str:
+    total = int(round(seconds))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def run_ffmpeg_with_progress(cmd: List[str], total_out_seconds: float):
+    cmd = list(cmd)
+    cmd.insert(-1, "-progress")
+    cmd.insert(-1, "pipe:1")
+    cmd.insert(-1, "-nostats")
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    last_emit = time.monotonic()
+    out_time_ms = None
+    speed = None
+    tail = []
+
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        if "=" not in line:
+            tail.append(line)
+            if len(tail) > 200:
+                tail.pop(0)
+            continue
+        key, val = line.split("=", 1)
+        if key == "out_time_ms":
+            try:
+                out_time_ms = int(val)
+            except Exception:
+                out_time_ms = None
+        elif key == "speed":
+            speed = val
+
+        now = time.monotonic()
+        if now - last_emit >= 10.0 and out_time_ms is not None:
+            elapsed = out_time_ms / 1_000_000.0
+            pct = None
+            if total_out_seconds > 0:
+                pct = min(100.0, max(0.0, 100.0 * elapsed / total_out_seconds))
+            pct_text = f"{pct:5.1f}%" if pct is not None else "  n/a"
+            speed_text = speed or "?"
+            print(f"Progress: {pct_text} time={format_duration(elapsed)} speed={speed_text}")
+            last_emit = now
+
+    rc = proc.wait()
+    if rc != 0:
+        if tail:
+            print("ffmpeg output (tail):")
+            for line in tail:
+                print(line)
+        raise SystemExit("ffmpeg failed (see output above).")
 
 
 def write_concat_file(out_dir: str, camera: str, entries: List[str]) -> str:
@@ -90,12 +153,16 @@ def run_ffmpeg(concat_path: str, out_mp4: str, *,
               fps: int,
               preset: str,
               cq: int,
+              encoder: str,
+              crf: int,
               maxrate: str,
               bufsize: str,
               aq_strength: int,
               audio_bitrate: str,
               audio_channels: int,
-              timelapse_audio: bool):
+              timelapse_audio: bool,
+              progress: bool = False,
+              total_out_seconds: Optional[float] = None):
     gop = int(CFG.gop_seconds) * int(fps)
 
     cmd = [
@@ -114,21 +181,33 @@ def run_ffmpeg(concat_path: str, out_mp4: str, *,
     if copy_mode:
         cmd += ["-c:v", "copy"]
     else:
-        cmd += [
-            "-r", str(fps),
-            "-c:v", "h264_nvenc",
-            "-preset", preset,
-            "-profile:v", CFG.nvenc_profile,
-            "-rc:v", CFG.nvenc_rc,
-            "-cq:v", str(cq),
-            "-b:v", CFG.nvenc_bv,
-            "-maxrate:v", str(maxrate),
-            "-bufsize:v", str(bufsize),
-            "-spatial-aq", "1",
-            "-temporal-aq", "1",
-            "-aq-strength", str(aq_strength),
-            "-g", str(gop),
-        ]
+        if encoder in ("h264_nvenc", "hevc_nvenc"):
+            cmd += [
+                "-r", str(fps),
+                "-c:v", encoder,
+                "-preset", preset,
+                "-rc:v", CFG.nvenc_rc,
+                "-cq:v", str(cq),
+                "-b:v", CFG.nvenc_bv,
+                "-maxrate:v", str(maxrate),
+                "-bufsize:v", str(bufsize),
+                "-spatial-aq", "1",
+                "-temporal-aq", "1",
+                "-aq-strength", str(aq_strength),
+                "-g", str(gop),
+            ]
+            if encoder == "h264_nvenc":
+                cmd += ["-profile:v", CFG.nvenc_profile]
+        elif encoder in ("libx264", "libx265"):
+            cmd += [
+                "-r", str(fps),
+                "-c:v", encoder,
+                "-preset", preset,
+                "-crf", str(crf),
+                "-g", str(gop),
+            ]
+        else:
+            raise SystemExit(f"Unsupported encoder: {encoder}")
 
     if timelapse is not None:
         cmd += ["-filter:v", f"setpts=PTS/{timelapse}"]
@@ -154,10 +233,13 @@ def run_ffmpeg(concat_path: str, out_mp4: str, *,
     cmd += ["-movflags", "+faststart", out_mp4]
 
     print("Running:", " ".join(cmd))
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if p.returncode != 0:
-        print(p.stdout.decode("utf-8", errors="replace"))
-        raise SystemExit("ffmpeg failed (see output above).")
+    if progress:
+        run_ffmpeg_with_progress(cmd, float(total_out_seconds or 0.0))
+    else:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if p.returncode != 0:
+            print(p.stdout.decode("utf-8", errors="replace"))
+            raise SystemExit("ffmpeg failed (see output above).")
 
 
 def parse_args():
@@ -174,11 +256,15 @@ def parse_args():
 
     p.add_argument("--timelapse", type=float, default=None)
     p.add_argument("--timelapse-audio", action="store_true", default=False)
+    p.add_argument("--progress", action="store_true", default=False)
 
     # encode params
     p.add_argument("--fps", type=int, default=CFG.fps)
+    p.add_argument("--encoder", default=CFG.default_encoder,
+                   choices=["h264_nvenc", "hevc_nvenc", "libx264", "libx265"])
     p.add_argument("--preset", default="p5")
     p.add_argument("--cq", type=int, default=23)
+    p.add_argument("--crf", type=int, default=CFG.default_crf)
     p.add_argument("--maxrate", default="6M")
     p.add_argument("--bufsize", default="12M")
     p.add_argument("--aq-strength", type=int, default=8)
@@ -235,6 +321,10 @@ def main():
     concat_path = write_concat_file(args.out_dir, cam, concat_entries)
     print(f"Concat:  {concat_path} entries={len(concat_entries)}")
 
+    total_out_seconds = sum([int(s["end"]) - int(s["start"]) for s in manifest["segments"]])
+    if args.timelapse is not None:
+        total_out_seconds = total_out_seconds / float(args.timelapse)
+
     run_ffmpeg(
         concat_path,
         out_mp4,
@@ -244,12 +334,16 @@ def main():
         fps=args.fps,
         preset=args.preset,
         cq=args.cq,
+        encoder=args.encoder,
+        crf=args.crf,
         maxrate=args.maxrate,
         bufsize=args.bufsize,
         aq_strength=args.aq_strength,
         audio_bitrate=args.audio_bitrate,
         audio_channels=args.audio_channels,
         timelapse_audio=args.timelapse_audio,
+        progress=args.progress,
+        total_out_seconds=total_out_seconds,
     )
 
     print("DONE:", out_mp4)
