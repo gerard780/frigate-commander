@@ -50,6 +50,8 @@ def parse_args():
     # disk
     p.add_argument("--recordings-path", default=frigate_sources.CFG.default_recordings_path)
     p.add_argument("--no-disk", action="store_true", default=False)
+    p.add_argument("--source", choices=["disk", "vod"], default="disk",
+                   help="Choose a single source (no fallback). Default: disk.")
     p.add_argument("--start-slop", type=float, default=2.0)
     p.add_argument("--end-slop", type=float, default=4.0)
 
@@ -142,7 +144,10 @@ def main():
     cadence = None
     disk_err = None
 
-    if not args.no_disk:
+    if args.no_disk:
+        args.source = "vod"
+
+    if args.source == "disk":
         # Recordings folder structure is UTC-based; derive scan window from epoch seconds.
         start_utc = datetime.fromtimestamp(after, tz=utc)
         end_utc = datetime.fromtimestamp(before, tz=utc)
@@ -155,30 +160,52 @@ def main():
             before,
             utc,
         )
+        if not disk_index:
+            print("Disk-only: no recordings found; falling back to VOD for all segments.")
+            args.source = "vod"
+
+    disk_failures = []
+
+    disk_failures = []
 
     for seg in segdoc["segments"]:
         s = int(seg["start"]); e = int(seg["end"])
         entry = {"start": s, "end": e}
 
-        if disk_index:
-            chosen, reason = frigate_sources.find_files_for_segment(
-                disk_index, cadence, s, e, args.start_slop, args.end_slop
-            )
-        else:
-            chosen, reason = None, (disk_err or "disk disabled")
-
-        if chosen:
-            used_disk += 1
-            entry["source"] = {"type": "disk", "files": [p for (_, p) in chosen], "cadence": cadence}
-        else:
+        if args.source == "vod":
             used_vod += 1
             entry["source"] = {
                 "type": "vod",
                 "url": frigate_sources.vod_url(segdoc["base_url"], args.camera, s, e),
-                "reason": reason
+                "reason": "source=vod"
             }
+        else:
+            if disk_index:
+                chosen, reason = frigate_sources.find_files_for_segment(
+                    disk_index, cadence, s, e, args.start_slop, args.end_slop
+                )
+            else:
+                chosen, reason = None, (disk_err or "disk disabled")
 
-        manifest_segments.append(entry)
+            if chosen:
+                used_disk += 1
+                entry["source"] = {"type": "disk", "files": [p for (_, p) in chosen], "cadence": cadence}
+            else:
+                disk_failures.append((s, e, reason))
+
+        if "source" in entry:
+            manifest_segments.append(entry)
+
+    if args.source == "disk" and disk_failures:
+        print("Disk-only: skipped unresolved segments (showing first 10).")
+        for s, e, reason in disk_failures[:10]:
+            start_local = datetime.fromtimestamp(s, tz=utc).astimezone(tz)
+            end_local = datetime.fromtimestamp(e, tz=utc).astimezone(tz)
+            start_label = start_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+            end_label = end_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+            vod = frigate_sources.vod_url(segdoc["base_url"], args.camera, s, e)
+            print(f"- {start_label} -> {end_label} ({s}-{e}) {reason}")
+            print(f"  VOD: {vod}")
 
     manifest = {
         "camera": args.camera,

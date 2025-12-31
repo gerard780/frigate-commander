@@ -16,7 +16,7 @@ Supports your disk naming:
 import os
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from statistics import median
 from typing import List, Tuple, Optional, Dict, Any
@@ -27,7 +27,7 @@ import requests
 @dataclass
 class Config:
     vod_url_template: str = "{base}/vod/{camera}/start/{start}/end/{end}/master.m3u8"
-    default_recordings_path: str = "~/docker/frigate/storage/recordings"
+    default_recordings_path: str = "/home/gdupont/docker/frigate/storage/recordings"
     headers: dict = None  # optional auth headers
 
 CFG = Config()
@@ -178,6 +178,8 @@ def parse_args():
     p.add_argument("--segments-json", required=True, help="Path to JSON output from frigate_segments.py")
     p.add_argument("--recordings-path", default=CFG.default_recordings_path)
     p.add_argument("--no-disk", action="store_true", default=False)
+    p.add_argument("--source", choices=["disk", "vod"], default="disk",
+                   help="Choose a single source (no fallback). Default: disk.")
 
     # how tolerant should disk coverage be?
     p.add_argument("--start-slop", type=float, default=2.0,
@@ -212,32 +214,54 @@ def main():
 
     segments = [(int(s["start"]), int(s["end"])) for s in segdoc["segments"]]
 
+    if args.no_disk:
+        args.source = "vod"
+
     disk_index = []
     cadence = None
     disk_err = None
-    if not args.no_disk:
+    if args.source == "disk":
         disk_index, cadence, disk_err = scan_index(args.recordings_path, camera, start_utc, end_utc, after, before, utc)
+        if not disk_index:
+            print("Disk-only: no recordings found; falling back to VOD for all segments.")
+            args.source = "vod"
 
     resolved = []
     used_disk = 0
     used_vod = 0
+    disk_failures = []
 
     for (s, e) in segments:
         entry: Dict[str, Any] = {"start": s, "end": e}
-        if disk_index:
-            chosen, reason = find_files_for_segment(disk_index, cadence, s, e, args.start_slop, args.end_slop)
-        else:
-            chosen, reason = None, (disk_err or "disk disabled")
-
-        if chosen:
-            used_disk += 1
-            entry["source"] = {"type": "disk", "files": [p for (_, p) in chosen], "cadence": cadence}
-        else:
+        if args.source == "vod":
             used_vod += 1
             u = vod_url(base_url, camera, s, e)
-            entry["source"] = {"type": "vod", "url": u, "reason": reason}
+            entry["source"] = {"type": "vod", "url": u, "reason": "source=vod"}
+        else:
+            if disk_index:
+                chosen, reason = find_files_for_segment(disk_index, cadence, s, e, args.start_slop, args.end_slop)
+            else:
+                chosen, reason = None, (disk_err or "disk disabled")
 
-        resolved.append(entry)
+            if chosen:
+                used_disk += 1
+                entry["source"] = {"type": "disk", "files": [p for (_, p) in chosen], "cadence": cadence}
+            else:
+                disk_failures.append((s, e, reason))
+
+        if "source" in entry:
+            resolved.append(entry)
+
+    if args.source == "disk" and disk_failures:
+        print("Disk-only: skipped unresolved segments (showing first 10).")
+        for s, e, reason in disk_failures[:10]:
+            start_local = datetime.fromtimestamp(s, tz=utc).astimezone(tz)
+            end_local = datetime.fromtimestamp(e, tz=utc).astimezone(tz)
+            start_label = start_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+            end_label = end_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+            vod = vod_url(base_url, camera, s, e)
+            print(f"- {start_label} -> {end_label} ({s}-{e}) {reason}")
+            print(f"  VOD: {vod}")
 
     manifest = {
         "camera": camera,
