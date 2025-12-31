@@ -13,6 +13,7 @@ So you still do ONE command, but internally it’s separated and testable.
 import os
 import argparse
 import json
+import subprocess
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -58,6 +59,16 @@ def parse_args():
     # output
     p.add_argument("--out-dir", default=frigate_render.CFG.out_dir)
     p.add_argument("--out-file", default=None)
+    p.add_argument("--playlist-out", default=None,
+                   help="Write a VLC-compatible M3U playlist of VOD URLs.")
+    p.add_argument("--playlist-only", action="store_true", default=False,
+                   help="Only write playlist (skip rendering).")
+    p.add_argument("--chapters-out", default=None,
+                   help="Write YouTube chapter timestamps to a text file.")
+    p.add_argument("--chapters-min", type=int, default=300,
+                   help="Minimum chapter length in seconds (default 300).")
+    p.add_argument("--chapters-gap", type=int, default=300,
+                   help="Merge chapters when gap is below this many seconds (default 300).")
 
     # render mode
     p.add_argument("--copy", action="store_true", default=True)
@@ -80,11 +91,215 @@ def parse_args():
     p.add_argument("--audio-bitrate", default="96k")
     p.add_argument("--audio-channels", type=int, default=1)
 
-    # debug artifacts
-    p.add_argument("--dump-json", action="store_true", default=False,
-                   help="Write intermediate JSON to out-dir for debugging.")
-
     return p.parse_args()
+
+
+def format_chapter_ts(seconds: int) -> str:
+    total = max(0, int(seconds))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def best_label_for_segment(seg_start: int, seg_end: int, events):
+    counts = {}
+    scores = {}
+    for ev in events:
+        label = ev.get("label")
+        if not label or not isinstance(label, str):
+            continue
+        ev_start = ev.get("start_time")
+        if ev_start is None:
+            continue
+        ev_end = ev.get("end_time") or ev_start
+        if float(ev_start) > float(seg_end) or float(ev_end) < float(seg_start):
+            continue
+        counts[label] = counts.get(label, 0) + 1
+        score = float(ev.get("top_score") or ev.get("score") or 0.0)
+        scores[label] = max(scores.get(label, 0.0), score)
+
+    if not counts:
+        return "Animal"
+
+    def sort_key(item):
+        label, count = item
+        return (count, scores.get(label, 0.0), label)
+
+    return max(counts.items(), key=sort_key)[0]
+
+
+def probe_duration(path: str) -> float:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=nk=1:nw=1",
+        path,
+    ]
+    try:
+        out = subprocess.check_output(cmd).decode("utf-8", errors="replace").strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+
+def build_segment_diagnostics(segments, events, tz, utc):
+    cache = {}
+    diagnostics = []
+    durations = []
+    prev_end = None
+
+    for seg in segments:
+        s = int(seg["start"]); e = int(seg["end"])
+        src = seg["source"]
+        est = max(1.0, float(e - s))
+
+        if src["type"] == "disk":
+            total = 0.0
+            for p in src.get("files", []):
+                if p not in cache:
+                    cache[p] = probe_duration(p)
+                total += cache[p]
+            actual = max(1.0, total) if total > 0 else est
+            file_count = len(src.get("files", []))
+        else:
+            actual = est
+            file_count = 0
+
+        gap_prev = None if prev_end is None else s - prev_end
+        prev_end = e
+
+        # Event overlap and padding info.
+        ev_start = None
+        ev_end = None
+        label_counts = {}
+        for ev in events:
+            label = ev.get("label")
+            if not label or not isinstance(label, str):
+                continue
+            st = ev.get("start_time")
+            if st is None:
+                continue
+            et = ev.get("end_time") or st
+            if float(st) > float(e) or float(et) < float(s):
+                continue
+            ev_start = float(st) if ev_start is None else min(ev_start, float(st))
+            ev_end = float(et) if ev_end is None else max(ev_end, float(et))
+            label_counts[label] = label_counts.get(label, 0) + 1
+
+        pad_before = None
+        pad_after = None
+        if ev_start is not None:
+            pad_before = float(s) - ev_start
+        if ev_end is not None:
+            pad_after = float(e) - ev_end
+
+        start_local = datetime.fromtimestamp(s, tz=utc).astimezone(tz)
+        end_local = datetime.fromtimestamp(e, tz=utc).astimezone(tz)
+
+        diagnostics.append({
+            "start": s,
+            "end": e,
+            "start_local": start_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "end_local": end_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "source": src["type"],
+            "files": file_count,
+            "est": est,
+            "actual": actual,
+            "diff": actual - est,
+            "gap_prev": gap_prev,
+            "pad_before": pad_before,
+            "pad_after": pad_after,
+            "labels": label_counts,
+        })
+        durations.append(actual)
+
+    return durations, diagnostics
+
+
+def build_chapters(segments, segment_durations, events, tz, utc, *, min_len: int, merge_gap: int):
+    chapters = []
+    current = None
+
+    for seg, seg_duration in zip(segments, segment_durations):
+        s = int(seg["start"]); e = int(seg["end"])
+        label = best_label_for_segment(s, e, events)
+
+        if current is None:
+            current = {
+                "start": s,
+                "end": e,
+                "label": label,
+                "duration": max(1.0, float(seg_duration)),
+                "segments": [(s, e, label)],
+            }
+            continue
+
+        gap = s - current["end"]
+        if gap <= int(merge_gap):
+            current["end"] = max(current["end"], e)
+            current["duration"] += max(1.0, float(seg_duration))
+            current["segments"].append((s, e, label))
+        else:
+            chapters.append(current)
+            current = {
+                "start": s,
+                "end": e,
+                "label": label,
+                "duration": max(1.0, float(seg_duration)),
+                "segments": [(s, e, label)],
+            }
+
+    if current is not None:
+        chapters.append(current)
+
+    # Merge short chapters only when they are close to a neighbor.
+    if chapters and int(min_len) > 0:
+        merged = []
+        i = 0
+        while i < len(chapters):
+            ch = chapters[i]
+            if ch["duration"] >= int(min_len) or len(chapters) == 1:
+                merged.append(ch)
+                i += 1
+                continue
+
+            prev = merged[-1] if merged else None
+            nxt = chapters[i + 1] if i + 1 < len(chapters) else None
+            prev_gap = (ch["start"] - prev["end"]) if prev else None
+            next_gap = (nxt["start"] - ch["end"]) if nxt else None
+
+            can_merge_prev = prev is not None and prev_gap is not None and prev_gap <= int(merge_gap)
+            can_merge_next = nxt is not None and next_gap is not None and next_gap <= int(merge_gap)
+
+            if can_merge_prev or can_merge_next:
+                if can_merge_prev and (not can_merge_next or prev_gap <= next_gap):
+                    prev["end"] = max(prev["end"], ch["end"])
+                    prev["duration"] += ch["duration"]
+                    prev["segments"].extend(ch["segments"])
+                    i += 1
+                else:
+                    nxt["start"] = min(nxt["start"], ch["start"])
+                    nxt["duration"] += ch["duration"]
+                    nxt["segments"] = ch["segments"] + nxt["segments"]
+                    i += 1
+            else:
+                merged.append(ch)
+                i += 1
+
+        chapters = merged
+
+    # Assign best label from combined segments.
+    for ch in chapters:
+        labels = [lbl for (_, _, lbl) in ch["segments"]]
+        if labels:
+            ch["label"] = max(set(labels), key=labels.count)
+
+        start_local = datetime.fromtimestamp(ch["start"], tz=utc).astimezone(tz)
+        ch["label_time"] = start_local.strftime("%H:%M:%S %Z")
+
+    return chapters
 
 
 def main():
@@ -228,12 +443,6 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    if args.dump_json:
-        with open(os.path.join(args.out_dir, "segments.json"), "w", encoding="utf-8") as f:
-            json.dump(segdoc, f, indent=2)
-        with open(os.path.join(args.out_dir, "manifest.json"), "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
-
     # ---- Step C: render ----
     concat_entries = frigate_render.build_concat_entries(manifest)
     concat_path = frigate_render.write_concat_file(args.out_dir, args.camera, concat_entries)
@@ -246,6 +455,85 @@ def main():
         base_label = f"{segdoc['base_day']}_to_{segdoc['base_day_end']}"
     out_mp4 = args.out_file or os.path.join(args.out_dir, f"{args.camera}-animals-{base_label}-{suffix}.mp4")
 
+    base_stem = os.path.splitext(out_mp4)[0]
+    segments_path = f"{base_stem}.segments.json"
+    manifest_path = f"{base_stem}.manifest.json"
+
+    with open(segments_path, "w", encoding="utf-8") as f:
+        json.dump(segdoc, f, indent=2)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    if args.playlist_out:
+        playlist_path = args.playlist_out
+    else:
+        playlist_path = f"{base_stem}.m3u"
+
+    lines = ["#EXTM3U\n"]
+    for seg in manifest_segments:
+        s = int(seg["start"]); e = int(seg["end"])
+        start_local = datetime.fromtimestamp(s, tz=utc).astimezone(tz)
+        end_local = datetime.fromtimestamp(e, tz=utc).astimezone(tz)
+        title = f"{args.camera} {start_local.strftime('%Y-%m-%d %H:%M:%S %Z')} -> {end_local.strftime('%H:%M:%S %Z')}"
+        duration = max(1, e - s)
+        vod = frigate_sources.vod_url(segdoc["base_url"], args.camera, s, e)
+        lines.append(f"#EXTINF:{duration},{title}\n")
+        lines.append(f"{vod}\n")
+    with open(playlist_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    print(f"Playlist: {playlist_path} entries={len(manifest_segments)}")
+
+    if args.chapters_out:
+        chapters_path = args.chapters_out
+    else:
+        chapters_path = f"{base_stem}-chapters.txt"
+
+    offset = 0
+    lines = []
+    segment_durations, segment_debug = build_segment_diagnostics(manifest_segments, filtered, tz, utc)
+    chapters = build_chapters(
+        manifest_segments,
+        segment_durations,
+        filtered,
+        tz,
+        utc,
+        min_len=args.chapters_min,
+        merge_gap=args.chapters_gap,
+    )
+    for ch in chapters:
+        lines.append(f"{format_chapter_ts(int(offset))} {ch['label']} {ch['label_time']}")
+        offset += ch["duration"]
+    with open(chapters_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"Chapters: {chapters_path} entries={len(lines)}")
+
+    debug_path = f"{base_stem}.debug.txt"
+    total_est = sum(d["est"] for d in segment_debug)
+    total_act = sum(d["actual"] for d in segment_debug)
+    total_diff = total_act - total_est
+
+    with open(debug_path, "w", encoding="utf-8") as f:
+        f.write(f"Output: {out_mp4}\n")
+        f.write(f"Window: {segdoc['window']['start_local']} -> {segdoc['window']['end_local']} ({window_tag})\n")
+        f.write(f"Params: pre_pad={args.pre_pad}s post_pad={args.post_pad}s merge_gap={args.merge_gap}s min_len={args.min_segment_len}s\n")
+        f.write(f"Chapters: min={args.chapters_min}s gap={args.chapters_gap}s\n")
+        f.write(f"Segments: total={len(segment_debug)} disk={used_disk} vod={used_vod} skipped={len(segment_debug) - used_disk - used_vod}\n")
+        f.write(f"Duration: est={total_est:.2f}s actual={total_act:.2f}s delta={total_diff:+.2f}s\n")
+        f.write("\n")
+        for i, d in enumerate(segment_debug, 1):
+            labels = ", ".join(
+                [f"{k}={v}" for k, v in sorted(d["labels"].items(), key=lambda kv: (-kv[1], kv[0]))]
+            )
+            pad_before = f"{d['pad_before']:.2f}s" if d["pad_before"] is not None else "n/a"
+            pad_after = f"{d['pad_after']:.2f}s" if d["pad_after"] is not None else "n/a"
+            gap_prev = f"{d['gap_prev']}" if d["gap_prev"] is not None else "n/a"
+            f.write(
+                f"#{i:02d} {d['start_local']} -> {d['end_local']} src={d['source']} files={d['files']} "
+                f"est={d['est']:.2f}s act={d['actual']:.2f}s diff={d['diff']:+.2f}s "
+                f"gap_prev={gap_prev}s pad_before={pad_before} pad_after={pad_after} labels=[{labels}]\n"
+            )
+    print(f"Debug: {debug_path} entries={len(segment_debug)}")
+
     # choose mode
     if args.timelapse is not None:
         copy_mode = False
@@ -256,6 +544,10 @@ def main():
     else:
         copy_mode = bool(args.copy)
         copy_audio = bool(args.copy_audio)
+
+    if args.playlist_only:
+        print("Skipping render (--playlist-only).")
+        return
 
     print(f"Camera: {args.camera}")
     print(f"Window: {segdoc['window']['start_local']} -> {segdoc['window']['end_local']} ({window_tag})")

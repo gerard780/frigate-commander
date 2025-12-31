@@ -14,6 +14,7 @@
 - Support multi-day windows in montage outputs.
 - Add encoder selection and ffmpeg progress output.
 - Default to disk-only sources and log skipped segments.
+- Auto-generate playlists, chapters, and debug reports for montage runs.
 ### Fixed
 - Fix render progress time import.
 
