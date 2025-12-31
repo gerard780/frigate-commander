@@ -33,6 +33,9 @@ def parse_args():
     p.add_argument("--longitude", type=float, default=frigate_segments.CFG.longitude)
 
     p.add_argument("--date", default=None)
+    p.add_argument("--start-date", default=None)
+    p.add_argument("--end-date", default=None)
+    p.add_argument("--days", type=int, default=None)
 
     g = p.add_mutually_exclusive_group()
     g.add_argument("--dawntodusk", action="store_true")
@@ -84,7 +87,7 @@ def main():
     # ---- Step A: build segments JSON (in-memory) ----
     tz = ZoneInfo(args.timezone)
     utc = ZoneInfo("UTC")
-    after, before, start_local, end_local, window_tag, base_day = frigate_segments.compute_window(args, tz)
+    after, before, start_local, end_local, window_tag, start_day, end_day = frigate_segments.compute_window(args, tz)
 
     events = frigate_segments.api_get(
         args.base_url, "/api/events",
@@ -115,7 +118,8 @@ def main():
         "base_url": args.base_url.rstrip("/"),
         "timezone": args.timezone,
         "window_tag": window_tag,
-        "base_day": base_day.isoformat(),
+        "base_day": start_day.isoformat(),
+        "base_day_end": end_day.isoformat(),
         "window": {
             "after": after,
             "before": before,
@@ -178,10 +182,12 @@ def main():
         "timezone": args.timezone,
         "window_tag": window_tag,
         "base_day": segdoc["base_day"],
+        "base_day_end": segdoc.get("base_day_end", segdoc["base_day"]),
         "window": segdoc["window"],
         "segments": manifest_segments,
         "stats": {
             "segments_total": len(manifest_segments),
+            "segments_skipped": len(disk_failures) if args.source == "disk" else 0,
             "disk_segments": used_disk,
             "vod_segments": used_vod,
             "disk_index_files": len(disk_index),
@@ -204,7 +210,10 @@ def main():
     suffix = window_tag
     if args.timelapse is not None:
         suffix += f"-timelapse{args.timelapse}x"
-    out_mp4 = args.out_file or os.path.join(args.out_dir, f"{args.camera}-animals-{segdoc['base_day']}-{suffix}.mp4")
+    base_label = segdoc["base_day"]
+    if segdoc.get("base_day_end") and segdoc["base_day_end"] != segdoc["base_day"]:
+        base_label = f"{segdoc['base_day']}_to_{segdoc['base_day_end']}"
+    out_mp4 = args.out_file or os.path.join(args.out_dir, f"{args.camera}-animals-{base_label}-{suffix}.mp4")
 
     # choose mode
     if args.timelapse is not None:

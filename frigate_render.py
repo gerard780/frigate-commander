@@ -200,13 +200,17 @@ def main():
     # output filename default derived from manifest info
     cam = manifest["camera"]
     base_day = manifest["base_day"]
+    base_day_end = manifest.get("base_day_end", base_day)
     window_tag = manifest["window_tag"]
 
     suffix = window_tag
     if args.timelapse is not None:
         suffix += f"-timelapse{args.timelapse}x"
 
-    out_mp4 = args.out_file or os.path.join(args.out_dir, f"{cam}-animals-{base_day}-{suffix}.mp4")
+    base_label = base_day
+    if base_day_end != base_day:
+        base_label = f"{base_day}_to_{base_day_end}"
+    out_mp4 = args.out_file or os.path.join(args.out_dir, f"{cam}-animals-{base_label}-{suffix}.mp4")
     os.makedirs(args.out_dir, exist_ok=True)
 
     # Decide actual mode

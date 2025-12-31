@@ -245,10 +245,12 @@ def main():
         "timezone": tz_name,
         "window_tag": segdoc["window_tag"],
         "base_day": segdoc["base_day"],
+        "base_day_end": segdoc.get("base_day_end", segdoc["base_day"]),
         "window": segdoc["window"],
         "segments": resolved,
         "stats": {
             "segments_total": len(segments),
+            "segments_skipped": len(disk_failures) if args.source == "disk" else 0,
             "disk_segments": used_disk,
             "vod_segments": used_vod,
             "disk_index_files": len(disk_index),
