@@ -70,8 +70,6 @@ def parse_args():
                    help="Minimum chapter length in seconds (default 300).")
     p.add_argument("--chapters-gap", type=int, default=300,
                    help="Merge chapters when gap is below this many seconds (default 300).")
-    p.add_argument("--probe-vod-durations", action="store_true", default=False,
-                   help="Use ffprobe to estimate VOD segment durations for chapter timing.")
 
     # upload
     p.add_argument("--upload", action="store_true", default=False,
@@ -150,29 +148,22 @@ def best_label_for_segment(seg_start: int, seg_end: int, events):
     return max(counts.items(), key=sort_key)[0]
 
 
-def probe_duration(path: str, *, timeout: int = 30) -> float:
+def probe_duration(path: str) -> float:
     cmd = [
         "ffprobe",
         "-v", "error",
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
         "-show_entries", "format=duration",
         "-of", "default=nk=1:nw=1",
         path,
     ]
     try:
-        out = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=timeout,
-        ).stdout.decode("utf-8", errors="replace").strip()
-        return float(out) if out else 0.0
+        out = subprocess.check_output(cmd).decode("utf-8", errors="replace").strip()
+        return float(out)
     except Exception:
         return 0.0
 
 
-def build_segment_diagnostics(segments, events, tz, utc, *, probe_vod: bool):
+def build_segment_diagnostics(segments, events, tz, utc):
     cache = {}
     diagnostics = []
     durations = []
@@ -192,12 +183,7 @@ def build_segment_diagnostics(segments, events, tz, utc, *, probe_vod: bool):
             actual = max(1.0, total) if total > 0 else est
             file_count = len(src.get("files", []))
         else:
-            if probe_vod:
-                actual = probe_duration(src.get("url", ""))
-                if actual <= 0:
-                    actual = est
-            else:
-                actual = est
+            actual = est
             file_count = 0
 
         gap_prev = None if prev_end is None else s - prev_end
@@ -522,13 +508,7 @@ def main():
 
     offset = 0
     lines = []
-    segment_durations, segment_debug = build_segment_diagnostics(
-        manifest_segments,
-        filtered,
-        tz,
-        utc,
-        probe_vod=args.probe_vod_durations,
-    )
+    segment_durations, segment_debug = build_segment_diagnostics(manifest_segments, filtered, tz, utc)
 
     labels = []
     for seg in manifest_segments:
