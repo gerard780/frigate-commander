@@ -14,6 +14,7 @@ import os
 import argparse
 import json
 import subprocess
+import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -69,6 +70,24 @@ def parse_args():
                    help="Minimum chapter length in seconds (default 300).")
     p.add_argument("--chapters-gap", type=int, default=300,
                    help="Merge chapters when gap is below this many seconds (default 300).")
+
+    # upload
+    p.add_argument("--upload", action="store_true", default=False,
+                   help="Upload the rendered MP4 to YouTube.")
+    p.add_argument("--upload-client-secret", default=None,
+                   help="Path to OAuth client secret JSON.")
+    p.add_argument("--upload-token", default=None,
+                   help="Path to token JSON (one per account).")
+    p.add_argument("--upload-title", default=None,
+                   help="Override upload title (default: output filename).")
+    p.add_argument("--upload-description", default=None,
+                   help="Override upload description (default: chapters text).")
+    p.add_argument("--upload-tags", nargs="*", default=None,
+                   help="Optional tags (space-separated).")
+    p.add_argument("--upload-privacy", default="unlisted",
+                   choices=["private", "unlisted", "public"])
+    p.add_argument("--upload-dry-run", action="store_true", default=False,
+                   help="Authorize and validate inputs without uploading.")
 
     # render mode
     p.add_argument("--copy", action="store_true", default=True)
@@ -589,6 +608,39 @@ def main():
     )
 
     print("DONE:", out_mp4)
+
+    if args.upload:
+        if not args.upload_client_secret or not args.upload_token:
+            raise SystemExit("--upload requires --upload-client-secret and --upload-token")
+
+        upload_title = args.upload_title or os.path.basename(out_mp4)
+        if args.upload_description is not None:
+            upload_desc = args.upload_description
+        else:
+            try:
+                with open(chapters_path, "r", encoding="utf-8") as f:
+                    upload_desc = f.read()
+            except Exception:
+                upload_desc = ""
+
+        cmd = [
+            sys.executable,
+            os.path.join(os.path.dirname(__file__), "scripts", "youtube_upload.py"),
+            "--client-secret", args.upload_client_secret,
+            "--token", args.upload_token,
+            "--file", out_mp4,
+            "--title", upload_title,
+            "--privacy", args.upload_privacy,
+        ]
+        if args.upload_tags:
+            cmd += ["--tags"] + list(args.upload_tags)
+        if upload_desc:
+            cmd += ["--description", upload_desc]
+        if args.upload_dry_run:
+            cmd += ["--dry-run"]
+
+        print("Upload:", " ".join(cmd))
+        subprocess.run(cmd, check=True)
 
 
 if __name__ == "__main__":
