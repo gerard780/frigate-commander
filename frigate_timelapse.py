@@ -195,8 +195,18 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
                      maxrate: Optional[str],
                      bufsize: Optional[str],
                      keep_audio: bool,
+                     scale: Optional[str],
                      qsv_device: Optional[str],
                      vaapi_device: Optional[str]):
+    def build_video_filter(use_hw_upload: bool) -> str:
+        parts = [f"setpts=PTS/{timelapse}"]
+        if scale:
+            parts.append(f"scale={scale}")
+        if use_hw_upload:
+            parts.append("format=nv12")
+            parts.append("hwupload")
+        return ",".join(parts)
+
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
@@ -205,7 +215,7 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
     ]
 
     if encoder in ("hevc_nvenc", "h264_nvenc"):
-        cmd += ["-filter:v", f"setpts=PTS/{timelapse}"]
+        cmd += ["-filter:v", build_video_filter(False)]
         cmd += [
             "-c:v", encoder,
             "-preset", preset,
@@ -224,7 +234,7 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
         else:
             cmd += ["-init_hw_device", "qsv=hw"]
         cmd += ["-filter_hw_device", "hw"]
-        cmd += ["-filter:v", f"setpts=PTS/{timelapse},format=nv12,hwupload"]
+        cmd += ["-filter:v", build_video_filter(True)]
         cmd += [
             "-c:v", encoder,
             "-preset", preset,
@@ -238,7 +248,7 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
     elif encoder in ("hevc_vaapi", "h264_vaapi"):
         device = vaapi_device or "/dev/dri/renderD128"
         cmd += ["-vaapi_device", device]
-        cmd += ["-filter:v", f"setpts=PTS/{timelapse},format=nv12,hwupload"]
+        cmd += ["-filter:v", build_video_filter(True)]
         cmd += [
             "-c:v", encoder,
         ]
@@ -249,7 +259,7 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
         if bufsize:
             cmd += ["-bufsize", str(bufsize)]
     elif encoder in ("libx265", "libx264"):
-        cmd += ["-filter:v", f"setpts=PTS/{timelapse}"]
+        cmd += ["-filter:v", build_video_filter(False)]
         cmd += [
             "-c:v", encoder,
             "-preset", preset,
@@ -309,6 +319,8 @@ def parse_args():
     p.add_argument("--crf", type=int, default=None, help="x264/x265 CRF (e.g. 18-24)")
     p.add_argument("--maxrate", default=None, help="NVENC maxrate, e.g. 12M")
     p.add_argument("--bufsize", default=None, help="NVENC bufsize, e.g. 24M")
+    p.add_argument("--scale", default=None,
+                   help="Output resolution, e.g. 1920:1080 or -2:1080 to keep aspect ratio")
     p.add_argument("--audio", action="store_true", default=False, help="Keep audio (time-scaled)")
     p.add_argument("--qsv-device", default=None, help="QSV device, e.g. /dev/dri/renderD128")
     p.add_argument("--vaapi-device", default=None, help="VAAPI device, e.g. /dev/dri/renderD128")
@@ -385,6 +397,7 @@ def main():
         maxrate=args.maxrate,
         bufsize=args.bufsize,
         keep_audio=bool(args.audio),
+        scale=args.scale,
         qsv_device=args.qsv_device,
         vaapi_device=args.vaapi_device,
     )
@@ -418,6 +431,8 @@ def main():
     print(f"Concat:  {concat_path}")
     print(f"Output:  {out_mp4}")
     print(f"Codec:   {args.encoder} preset={preset} timelapse={args.timelapse}x fps={args.fps}")
+    if args.scale:
+        print(f"Scale:   {args.scale}")
     print(estimate_line)
 
     run_ffmpeg_with_progress(cmd, output_seconds)

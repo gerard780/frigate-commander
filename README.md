@@ -58,6 +58,9 @@ Timelapse (multi-day)
 # 3 days, 50x speed, encode with NVENC.
 python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 3 --timelapse 50 --encoder hevc_nvenc --fps 20 --cq 19
 
+# Scale to 1080p height, preserve aspect ratio.
+python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 3 --timelapse 50 --encoder hevc_nvenc --fps 20 --cq 19 --scale -2:1080
+
 # Software encode (libx265) with CRF.
 python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 3 --timelapse 50 --encoder libx265 --crf 23
 
