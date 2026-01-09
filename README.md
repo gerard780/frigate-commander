@@ -55,11 +55,14 @@ python3 frigate_montage.py --camera TapoC560WS --start-date 2025-12-01 --end-dat
 
 Timelapse (multi-day)
 ---------------------
-# 3 days, 50x speed, encode with NVENC.
+# 3 days, 50x speed, encode with NVENC (AQ enabled by default).
 python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 3 --timelapse 50 --encoder hevc_nvenc --fps 20 --cq 19
 
 # Scale to 1080p height, preserve aspect ratio (CUDA scale for NVENC).
 python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 3 --timelapse 50 --encoder hevc_nvenc --fps 20 --cq 19 --scale -2:1080 --cuda
+
+# Disable AQ if needed.
+python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 3 --timelapse 50 --encoder hevc_nvenc --fps 20 --cq 19 --spatial-aq 0 --temporal-aq 0
 
 # Software encode (libx265) with CRF.
 python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 3 --timelapse 50 --encoder libx265 --crf 23

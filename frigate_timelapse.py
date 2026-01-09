@@ -197,6 +197,9 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
                      keep_audio: bool,
                      scale: Optional[str],
                      use_cuda: bool,
+                     spatial_aq: bool,
+                     temporal_aq: bool,
+                     aq_strength: Optional[int],
                      qsv_device: Optional[str],
                      vaapi_device: Optional[str]):
     def build_video_filter(use_hw_upload: bool, use_cuda_scale: bool) -> str:
@@ -229,6 +232,12 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
         ]
         if cq is not None:
             cmd += ["-cq:v", str(cq)]
+        if spatial_aq:
+            cmd += ["-spatial-aq", "1"]
+            if aq_strength is not None:
+                cmd += ["-aq-strength", str(aq_strength)]
+        if temporal_aq:
+            cmd += ["-temporal-aq", "1"]
         cmd += ["-b:v", "0"]
         if maxrate:
             cmd += ["-maxrate:v", str(maxrate)]
@@ -329,6 +338,12 @@ def parse_args():
                    help="Output resolution, e.g. 1920:1080 or -2:1080 to keep aspect ratio")
     p.add_argument("--cuda", action="store_true", default=False,
                    help="Use CUDA decode + scale_npp (NVENC only)")
+    p.add_argument("--spatial-aq", action="store_true", default=None,
+                   help="Enable NVENC spatial AQ (default: on for NVENC)")
+    p.add_argument("--temporal-aq", action="store_true", default=None,
+                   help="Enable NVENC temporal AQ (default: on for NVENC)")
+    p.add_argument("--aq-strength", type=int, default=None,
+                   help="NVENC AQ strength (default: 8 when spatial AQ is on)")
     p.add_argument("--audio", action="store_true", default=False, help="Keep audio (time-scaled)")
     p.add_argument("--qsv-device", default=None, help="QSV device, e.g. /dev/dri/renderD128")
     p.add_argument("--vaapi-device", default=None, help="VAAPI device, e.g. /dev/dri/renderD128")
@@ -392,6 +407,14 @@ def main():
 
     cq = args.cq if args.cq is not None else (CFG.default_nvenc_cq if args.encoder.endswith("_nvenc") else None)
     crf = args.crf if args.crf is not None else (CFG.default_x265_crf if args.encoder in ("libx265", "libx264") else None)
+    if args.encoder.endswith("_nvenc"):
+        spatial_aq = True if args.spatial_aq is None else bool(args.spatial_aq)
+        temporal_aq = True if args.temporal_aq is None else bool(args.temporal_aq)
+        aq_strength = args.aq_strength if args.aq_strength is not None else 8
+    else:
+        spatial_aq = False
+        temporal_aq = False
+        aq_strength = None
 
     cmd = build_ffmpeg_cmd(
         concat_path,
@@ -407,6 +430,9 @@ def main():
         keep_audio=bool(args.audio),
         scale=args.scale,
         use_cuda=bool(args.cuda),
+        spatial_aq=spatial_aq,
+        temporal_aq=temporal_aq,
+        aq_strength=aq_strength,
         qsv_device=args.qsv_device,
         vaapi_device=args.vaapi_device,
     )
@@ -444,6 +470,13 @@ def main():
         print(f"Scale:   {args.scale}")
     if args.cuda and args.encoder in ("hevc_nvenc", "h264_nvenc"):
         print("CUDA:    enabled (decode + scale_npp)")
+    if spatial_aq or temporal_aq:
+        aq_bits = []
+        if spatial_aq:
+            aq_bits.append(f"spatial aq={aq_strength}")
+        if temporal_aq:
+            aq_bits.append("temporal aq")
+        print("AQ:      " + ", ".join(aq_bits))
     print(estimate_line)
 
     run_ffmpeg_with_progress(cmd, output_seconds)
