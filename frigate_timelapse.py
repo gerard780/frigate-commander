@@ -196,26 +196,32 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
                      bufsize: Optional[str],
                      keep_audio: bool,
                      scale: Optional[str],
+                     use_cuda: bool,
                      qsv_device: Optional[str],
                      vaapi_device: Optional[str]):
-    def build_video_filter(use_hw_upload: bool) -> str:
+    def build_video_filter(use_hw_upload: bool, use_cuda_scale: bool) -> str:
         parts = [f"setpts=PTS/{timelapse}"]
         if scale:
-            parts.append(f"scale={scale}")
+            if use_cuda_scale:
+                parts.append(f"scale_npp={scale}")
+            else:
+                parts.append(f"scale={scale}")
         if use_hw_upload:
             parts.append("format=nv12")
             parts.append("hwupload")
         return ",".join(parts)
 
-    cmd = [
-        "ffmpeg", "-y",
+    cmd = ["ffmpeg", "-y"]
+    if use_cuda and encoder in ("hevc_nvenc", "h264_nvenc"):
+        cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+    cmd += [
         "-f", "concat", "-safe", "0",
         "-i", concat_path,
         "-r", str(fps),
     ]
 
     if encoder in ("hevc_nvenc", "h264_nvenc"):
-        cmd += ["-filter:v", build_video_filter(False)]
+        cmd += ["-filter:v", build_video_filter(False, use_cuda and bool(scale))]
         cmd += [
             "-c:v", encoder,
             "-preset", preset,
@@ -234,7 +240,7 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
         else:
             cmd += ["-init_hw_device", "qsv=hw"]
         cmd += ["-filter_hw_device", "hw"]
-        cmd += ["-filter:v", build_video_filter(True)]
+        cmd += ["-filter:v", build_video_filter(True, False)]
         cmd += [
             "-c:v", encoder,
             "-preset", preset,
@@ -248,7 +254,7 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
     elif encoder in ("hevc_vaapi", "h264_vaapi"):
         device = vaapi_device or "/dev/dri/renderD128"
         cmd += ["-vaapi_device", device]
-        cmd += ["-filter:v", build_video_filter(True)]
+        cmd += ["-filter:v", build_video_filter(True, False)]
         cmd += [
             "-c:v", encoder,
         ]
@@ -259,7 +265,7 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
         if bufsize:
             cmd += ["-bufsize", str(bufsize)]
     elif encoder in ("libx265", "libx264"):
-        cmd += ["-filter:v", build_video_filter(False)]
+        cmd += ["-filter:v", build_video_filter(False, False)]
         cmd += [
             "-c:v", encoder,
             "-preset", preset,
@@ -271,7 +277,7 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
 
     if encoder in ("hevc_qsv", "h264_qsv", "hevc_vaapi", "h264_vaapi"):
         cmd += ["-pix_fmt", "nv12"]
-    else:
+    elif not (use_cuda and encoder in ("hevc_nvenc", "h264_nvenc")):
         cmd += ["-pix_fmt", "yuv420p"]
 
     if keep_audio:
@@ -321,6 +327,8 @@ def parse_args():
     p.add_argument("--bufsize", default=None, help="NVENC bufsize, e.g. 24M")
     p.add_argument("--scale", default=None,
                    help="Output resolution, e.g. 1920:1080 or -2:1080 to keep aspect ratio")
+    p.add_argument("--cuda", action="store_true", default=False,
+                   help="Use CUDA decode + scale_npp (NVENC only)")
     p.add_argument("--audio", action="store_true", default=False, help="Keep audio (time-scaled)")
     p.add_argument("--qsv-device", default=None, help="QSV device, e.g. /dev/dri/renderD128")
     p.add_argument("--vaapi-device", default=None, help="VAAPI device, e.g. /dev/dri/renderD128")
@@ -398,6 +406,7 @@ def main():
         bufsize=args.bufsize,
         keep_audio=bool(args.audio),
         scale=args.scale,
+        use_cuda=bool(args.cuda),
         qsv_device=args.qsv_device,
         vaapi_device=args.vaapi_device,
     )
@@ -433,6 +442,8 @@ def main():
     print(f"Codec:   {args.encoder} preset={preset} timelapse={args.timelapse}x fps={args.fps}")
     if args.scale:
         print(f"Scale:   {args.scale}")
+    if args.cuda and args.encoder in ("hevc_nvenc", "h264_nvenc"):
+        print("CUDA:    enabled (decode + scale_npp)")
     print(estimate_line)
 
     run_ffmpeg_with_progress(cmd, output_seconds)
