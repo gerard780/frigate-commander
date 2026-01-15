@@ -311,6 +311,10 @@ def parse_args():
     p.add_argument("--start-date", default=None, help="YYYY-MM-DD (overrides --date)")
     p.add_argument("--end-date", default=None, help="YYYY-MM-DD (inclusive)")
     p.add_argument("--days", type=int, default=None, help="Number of days starting at start-date/date")
+    p.add_argument("--start-time", default=None,
+                   help="Start timestamp (ISO-8601 or epoch seconds, local tz if no offset)")
+    p.add_argument("--end-time", default=None,
+                   help="End timestamp (ISO-8601 or epoch seconds, local tz if no offset)")
 
     g = p.add_mutually_exclusive_group()
     g.add_argument("--dawntodusk", action="store_true")

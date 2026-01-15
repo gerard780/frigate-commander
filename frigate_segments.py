@@ -70,12 +70,39 @@ def label_is_animal(label: str) -> bool:
     return label in CFG.include_labels
 
 
+def parse_time_arg(value: str, tz: ZoneInfo) -> datetime:
+    s = value.strip()
+    if s.replace(".", "", 1).lstrip("-").isdigit():
+        ts = float(s)
+        return datetime.fromtimestamp(ts, tz=ZoneInfo("UTC")).astimezone(tz)
+
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
+
+
 def compute_window(args, tz: ZoneInfo):
     """
     Returns:
       after_ts, before_ts, start_local_dt, end_local_dt, window_tag, start_day, end_day
     """
     now_local = datetime.now(tz)
+    start_time = getattr(args, "start_time", None)
+    end_time = getattr(args, "end_time", None)
+    if start_time or end_time:
+        if not (start_time and end_time):
+            raise SystemExit("start-time and end-time must be provided together")
+        if args.dawntodusk or args.dusktodawn:
+            raise SystemExit("start-time/end-time cannot be used with dawn/dusk windows")
+        start_dt_local = parse_time_arg(start_time, tz)
+        end_dt_local = parse_time_arg(end_time, tz)
+        if end_dt_local <= start_dt_local:
+            raise SystemExit("end-time must be after start-time")
+        window_tag = "custom"
+        start_day = start_dt_local.date()
+        end_day = end_dt_local.date()
+        return int(start_dt_local.timestamp()), int(end_dt_local.timestamp()), start_dt_local, end_dt_local, window_tag, start_day, end_day
     start_day = date_cls.fromisoformat(args.start_date) if args.start_date else None
     if start_day is None:
         start_day = date_cls.fromisoformat(args.date) if args.date else (now_local - timedelta(days=1)).date()
@@ -173,6 +200,10 @@ def parse_args():
     p.add_argument("--start-date", default=None, help="YYYY-MM-DD (overrides --date for multi-day)")
     p.add_argument("--end-date", default=None, help="YYYY-MM-DD (end day inclusive)")
     p.add_argument("--days", type=int, default=None, help="Number of days starting at start-date/date")
+    p.add_argument("--start-time", default=None,
+                   help="Start timestamp (ISO-8601 or epoch seconds, local tz if no offset)")
+    p.add_argument("--end-time", default=None,
+                   help="End timestamp (ISO-8601 or epoch seconds, local tz if no offset)")
 
     g = p.add_mutually_exclusive_group()
     g.add_argument("--dawntodusk", action="store_true")

@@ -31,6 +31,9 @@ python3 frigate_montage.py --camera TapoC560WS --dusktodawn --date 2025-12-30 --
 # Use a different Frigate base URL.
 python3 frigate_montage.py --base-url http://192.168.15.194:5000 --camera KC420WS --dusktodawn --date 2025-12-30
 
+# Exact time window (local time).
+python3 frigate_montage.py --camera TapoC560WS --start-time 2025-01-08T14:45:00 --end-time 2025-01-08T15:00:00
+
 # Use VOD only (disk is default).
 python3 frigate_montage.py --source vod --camera TapoC560WS --dusktodawn --date 2025-12-30
 
