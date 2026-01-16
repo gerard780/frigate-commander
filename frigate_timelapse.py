@@ -9,7 +9,6 @@ This script does NOT use detections; it scans recordings by time window.
 import os
 import argparse
 import subprocess
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
@@ -18,6 +17,7 @@ from zoneinfo import ZoneInfo
 import frigate_segments
 import frigate_sources
 import frigate_render
+from utils import atempo_chain_for_speed, format_duration, run_ffmpeg_with_progress
 
 
 @dataclass
@@ -36,18 +36,6 @@ def build_concat_entries(files: List[str]) -> List[str]:
     return [f"file '{p}'\n" for p in files]
 
 
-def atempo_chain_for_speed(speed: float):
-    factors = []
-    remaining = speed
-    while remaining > 2.0 + 1e-9:
-        factors.append(2.0)
-        remaining /= 2.0
-    if abs(remaining - 1.0) > 1e-9:
-        remaining = max(0.5, min(2.0, remaining))
-        factors.append(remaining)
-    return factors
-
-
 def parse_bitrate(value: str) -> int:
     text = value.strip().lower()
     if text.endswith("k"):
@@ -57,14 +45,6 @@ def parse_bitrate(value: str) -> int:
     if text.endswith("g"):
         return int(float(text[:-1]) * 1000 * 1000 * 1000)
     return int(float(text))
-
-
-def format_duration(seconds: float) -> str:
-    total = int(round(seconds))
-    h = total // 3600
-    m = (total % 3600) // 60
-    s = total % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -128,61 +108,6 @@ def estimate_bitrate_bps(width: int, height: int, fps: float, encoder: str,
 
     bpp = base_bpp * quality_factor
     return int(round(width * height * fps * bpp))
-
-
-def run_ffmpeg_with_progress(cmd: List[str], total_out_seconds: float):
-    cmd = list(cmd)
-    cmd.insert(-1, "-progress")
-    cmd.insert(-1, "pipe:1")
-    cmd.insert(-1, "-nostats")
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    last_emit = time.monotonic()
-    out_time_ms = None
-    speed = None
-    tail = []
-
-    while True:
-        line = proc.stdout.readline()
-        if not line:
-            break
-        line = line.strip()
-        if not line:
-            continue
-        if "=" not in line:
-            tail.append(line)
-            if len(tail) > 200:
-                tail.pop(0)
-            continue
-        key, val = line.split("=", 1)
-        if key == "out_time_ms":
-            try:
-                out_time_ms = int(val)
-            except Exception:
-                out_time_ms = None
-        elif key == "speed":
-            speed = val
-        elif key == "progress" and val == "end":
-            pass
-
-        now = time.monotonic()
-        if now - last_emit >= 10.0 and out_time_ms is not None:
-            elapsed = out_time_ms / 1_000_000.0
-            pct = None
-            if total_out_seconds > 0:
-                pct = min(100.0, max(0.0, 100.0 * elapsed / total_out_seconds))
-            pct_text = f"{pct:5.1f}%" if pct is not None else "  n/a"
-            speed_text = speed or "?"
-            print(f"Progress: {pct_text} time={format_duration(elapsed)} speed={speed_text}")
-            last_emit = now
-
-    rc = proc.wait()
-    if rc != 0:
-        if tail:
-            print("ffmpeg output (tail):")
-            for line in tail:
-                print(line)
-        raise SystemExit("ffmpeg failed (see output above).")
 
 
 def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,

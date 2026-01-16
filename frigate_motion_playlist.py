@@ -8,31 +8,18 @@ Generate an M3U playlist for motion-only review items (no detection event).
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from zoneinfo import ZoneInfo
 
-import requests
+from utils import api_get, vod_url
 
 
 @dataclass
 class Config:
     base_url: str = "http://127.0.0.1:5000"
     timezone: str = "America/New_York"
-    vod_url_template: str = "{base}/vod/{camera}/start/{start}/end/{end}/master.m3u8"
 
 CFG = Config()
-
-
-def api_get(base_url: str, path: str, params=None, headers=None):
-    url = base_url.rstrip("/") + path
-    r = requests.get(url, params=params, headers=headers or {}, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-
-def vod_url(base_url: str, camera: str, start: int, end: int) -> str:
-    base = base_url.rstrip("/")
-    return CFG.vod_url_template.format(base=base, camera=camera, start=start, end=end)
 
 
 def parse_args():

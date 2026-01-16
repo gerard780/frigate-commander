@@ -16,17 +16,18 @@ Supports your disk naming:
 import os
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from statistics import median
 from typing import List, Tuple, Optional, Dict, Any
 
 import requests
 
+from utils import vod_url
+
 
 @dataclass
 class Config:
-    vod_url_template: str = "{base}/vod/{camera}/start/{start}/end/{end}/master.m3u8"
     default_recordings_path: str = "/home/gdupont/docker/frigate/storage/recordings"
     headers: dict = None  # optional auth headers
 
@@ -35,11 +36,6 @@ CFG = Config()
 
 def expand_path(p: str) -> str:
     return os.path.abspath(os.path.expanduser(p))
-
-
-def vod_url(base_url: str, camera: str, start: int, end: int) -> str:
-    base = base_url.rstrip("/")
-    return CFG.vod_url_template.format(base=base, camera=camera, start=start, end=end)
 
 
 def probe_url(url: str) -> bool:

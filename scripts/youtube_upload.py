@@ -6,20 +6,30 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
 def get_service(client_secret: str, token_path: str):
+    creds = None
     if os.path.exists(token_path):
         creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-    else:
+
+    if creds and creds.expired and creds.refresh_token:
+        print("Refreshing expired token...")
+        creds.refresh(Request())
+        with open(token_path, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+        print("Token refreshed and saved.")
+    elif not creds or not creds.valid:
         flow = InstalledAppFlow.from_client_secrets_file(client_secret, SCOPES)
         creds = flow.run_local_server(port=0)
         os.makedirs(os.path.dirname(token_path), exist_ok=True)
         with open(token_path, "w", encoding="utf-8") as f:
             f.write(creds.to_json())
+
     return build("youtube", "v3", credentials=creds)
 
 

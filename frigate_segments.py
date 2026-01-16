@@ -22,9 +22,10 @@ from datetime import datetime, timedelta, date as date_cls
 from zoneinfo import ZoneInfo
 from typing import List, Tuple, Dict, Any
 
-import requests
 from astral import LocationInfo
 from astral.sun import dawn, dusk
+
+from utils import api_get
 
 
 @dataclass
@@ -55,13 +56,6 @@ class Config:
     }
 
 CFG = Config()
-
-
-def api_get(base_url: str, path: str, params=None, headers=None):
-    url = base_url.rstrip("/") + path
-    r = requests.get(url, params=params, headers=headers or {}, timeout=60)
-    r.raise_for_status()
-    return r.json()
 
 
 def label_is_animal(label: str) -> bool:
