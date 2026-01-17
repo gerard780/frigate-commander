@@ -153,8 +153,8 @@ Troubleshooting
 - Quota exceeded? YouTube API has daily upload limits.
 
 ### Segments are too short or too long
-- Adjust `--pre-padding` and `--post-padding` (default 2 seconds each).
-- Adjust `--merge-gap` to consolidate nearby segments (default 5 seconds).
+- Adjust `--pre-pad` and `--post-pad` (default 5 seconds each).
+- Adjust `--merge-gap` to consolidate nearby segments (default 15 seconds).
 - Use `--min-score` to filter low-confidence detections.
 
 ### Performance issues
