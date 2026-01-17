@@ -58,10 +58,13 @@ class Config:
 CFG = Config()
 
 
-def label_is_animal(label: str) -> bool:
-    if label in CFG.exclude_labels:
+def label_is_animal(label: str, include_labels=None, exclude_labels=None) -> bool:
+    """Check if label is an animal based on include/exclude sets."""
+    inc = include_labels if include_labels is not None else CFG.include_labels
+    exc = exclude_labels if exclude_labels is not None else CFG.exclude_labels
+    if label in exc:
         return False
-    return label in CFG.include_labels
+    return label in inc
 
 
 def parse_time_arg(value: str, tz: ZoneInfo) -> datetime:
@@ -209,6 +212,11 @@ def parse_args():
     p.add_argument("--min-segment-len", type=int, default=2)
     p.add_argument("--min-score", type=float, default=0.0)
 
+    p.add_argument("--labels-include", default=None,
+                   help="Comma-separated labels to include (replaces default animal list).")
+    p.add_argument("--labels-exclude", default=None,
+                   help="Comma-separated labels to exclude (adds to default exclusions).")
+
     p.add_argument("--limit", type=int, default=5000)
     p.add_argument("--json", action="store_true", help="Output JSON only (no pretty prints)")
 
@@ -220,6 +228,15 @@ def main():
     tz = ZoneInfo(args.timezone)
 
     after, before, start_local, end_local, window_tag, start_day, end_day = compute_window(args, tz)
+
+    # Parse label filter overrides
+    include_labels = None
+    exclude_labels = None
+    if args.labels_include:
+        include_labels = {l.strip() for l in args.labels_include.split(",") if l.strip()}
+    if args.labels_exclude:
+        # Add to default exclusions
+        exclude_labels = CFG.exclude_labels | {l.strip() for l in args.labels_exclude.split(",") if l.strip()}
 
     params = {"camera": args.camera, "after": after, "before": before, "limit": args.limit}
     events = api_get(args.base_url, "/api/events", params=params, headers=CFG.headers)
@@ -241,7 +258,7 @@ def main():
         if score < float(args.min_score):
             continue
 
-        if label_is_animal(label):
+        if label_is_animal(label, include_labels=include_labels, exclude_labels=exclude_labels):
             filtered.append(ev)
 
     filtered.sort(key=lambda e: float(e.get("start_time") or 0.0))

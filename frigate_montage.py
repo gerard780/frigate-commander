@@ -53,6 +53,11 @@ def parse_args():
     p.add_argument("--min-segment-len", type=int, default=2)
     p.add_argument("--min-score", type=float, default=0.0)
 
+    p.add_argument("--labels-include", default=None,
+                   help="Comma-separated labels to include (replaces default animal list).")
+    p.add_argument("--labels-exclude", default=None,
+                   help="Comma-separated labels to exclude (adds to default exclusions).")
+
     # disk
     p.add_argument("--recordings-path", default=frigate_sources.CFG.default_recordings_path)
     p.add_argument("--no-disk", action="store_true", default=False)
@@ -100,6 +105,10 @@ def parse_args():
     p.add_argument("--timelapse", type=float, default=None)
     p.add_argument("--timelapse-audio", action="store_true", default=False)
     p.add_argument("--progress", action="store_true", default=False)
+
+    # dry-run
+    p.add_argument("--dry-run", action="store_true", default=False,
+                   help="Run segments/sources, write JSON/playlist/chapters, print ffmpeg command without executing.")
 
     # encode params
     p.add_argument("--fps", type=int, default=frigate_render.CFG.fps)
@@ -340,6 +349,14 @@ def main():
     if not isinstance(events, list):
         raise SystemExit(f"Unexpected /api/events response: {type(events)}")
 
+    # Parse label filter overrides
+    include_labels = None
+    exclude_labels = None
+    if args.labels_include:
+        include_labels = {l.strip() for l in args.labels_include.split(",") if l.strip()}
+    if args.labels_exclude:
+        exclude_labels = frigate_segments.CFG.exclude_labels | {l.strip() for l in args.labels_exclude.split(",") if l.strip()}
+
     filtered = []
     for ev in events:
         label = ev.get("label")
@@ -348,7 +365,7 @@ def main():
         score = float(ev.get("top_score") or ev.get("score") or 0.0)
         if score < float(args.min_score):
             continue
-        if frigate_segments.label_is_animal(label):
+        if frigate_segments.label_is_animal(label, include_labels=include_labels, exclude_labels=exclude_labels):
             filtered.append(ev)
 
     raw_segments = frigate_segments.build_segments_from_events(
@@ -609,11 +626,15 @@ def main():
         timelapse_audio=args.timelapse_audio,
         progress=args.progress,
         total_out_seconds=total_out_seconds,
+        dry_run=args.dry_run,
     )
 
-    print("DONE:", out_mp4)
+    if args.dry_run:
+        print("DRY-RUN complete (no video rendered).")
+    else:
+        print("DONE:", out_mp4)
 
-    if args.upload:
+    if args.upload and not args.dry_run:
         if not args.upload_client_secret or not args.upload_token:
             raise SystemExit("--upload requires --upload-client-secret and --upload-token")
 

@@ -94,6 +94,74 @@ BASE_URL=http://192.168.15.194:5000 CAMERA=KC420WS ./scripts/cron_dusktodawn.sh
 # Environment variables:
 # REPO_DIR, CAMERA, BASE_URL, OUT_DIR, CLIENT_SECRET, TOKEN_PATH, PRIVACY, TITLE
 
+Dry-Run Mode
+------------
+Validate your configuration without rendering:
+```bash
+python3 frigate_montage.py --camera TapoC560WS --dawntodusk --date 2025-12-30 --dry-run
+```
+This will query the API, resolve sources, build the concat file, and print the ffmpeg command without executing it.
+
+Custom Label Filters
+--------------------
+Override the default animal labels:
+```bash
+# Only include specific animals
+python3 frigate_montage.py --camera TapoC560WS --dawntodusk --labels-include bird,cat,dog
+
+# Exclude specific labels (in addition to defaults)
+python3 frigate_montage.py --camera TapoC560WS --dawntodusk --labels-exclude squirrel,rabbit
+
+# Combine both
+python3 frigate_montage.py --camera TapoC560WS --dawntodusk --labels-include bird,cat --labels-exclude person
+```
+
+Troubleshooting
+---------------
+
+### No segments found / empty output
+- Check that your camera name matches exactly: `--camera` is case-sensitive.
+- Verify the Frigate base URL is reachable: `curl http://127.0.0.1:5000/api/events?limit=1`
+- Ensure events exist in the time window. Try `--date` with a known active day.
+- Check label filters: use `--labels-include` to broaden or verify `Config.include_labels`.
+
+### VOD probe failed
+- The VOD URL returned a non-2xx status. Check that Frigate VOD is accessible.
+- Verify the base URL doesn't have a trailing slash issue.
+- If using a reverse proxy, ensure `/vod/` paths are forwarded correctly.
+- Custom VOD URL? Edit `CFG.vod_url_template` in `frigate_sources.py`.
+
+### Disk-only: no recordings found
+- Verify `--recordings-path` points to your Frigate recordings folder.
+- Check folder structure: `recordings/YYYY-MM-DD/HH/<camera>/MM.SS.mp4`
+- Recordings folder uses UTC timestamps, not local time.
+- Try `--source vod` to bypass disk and use VOD URLs directly.
+
+### ffmpeg errors
+- "Protocol not found": Add protocols to whitelist in `frigate_render.py` Config.
+- "Invalid data": Corrupt segment file. Check disk for bad recordings.
+- "No such file": Disk file was deleted between source resolution and render.
+- Use `--dry-run` to see the exact ffmpeg command being generated.
+
+### Dawn/dusk times are wrong
+- Default lat/lon is Shelbyville, KY. Edit `Config.latitude` and `Config.longitude` in `frigate_segments.py`.
+- Verify timezone: `--timezone America/New_York` (uses IANA timezone names).
+
+### YouTube upload fails
+- Token expired? The script now auto-refreshes. Delete old token and re-auth if issues persist.
+- Check `--client-secret` path points to valid OAuth credentials JSON.
+- Quota exceeded? YouTube API has daily upload limits.
+
+### Segments are too short or too long
+- Adjust `--pre-padding` and `--post-padding` (default 2 seconds each).
+- Adjust `--merge-gap` to consolidate nearby segments (default 5 seconds).
+- Use `--min-score` to filter low-confidence detections.
+
+### Performance issues
+- Large time windows scan many disk folders. Consider `--source vod` for speed.
+- NVENC encoding is faster than software (libx264/libx265).
+- Use `--timelapse` to reduce output duration for long recordings.
+
 Notes
 -----
 - Disk recordings are preferred by default. VOD is used only if disk has no files.

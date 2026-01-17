@@ -91,7 +91,8 @@ def run_ffmpeg(concat_path: str, out_mp4: str, *,
               audio_channels: int,
               timelapse_audio: bool,
               progress: bool = False,
-              total_out_seconds: Optional[float] = None):
+              total_out_seconds: Optional[float] = None,
+              dry_run: bool = False):
     gop = int(CFG.gop_seconds) * int(fps)
 
     cmd = [
@@ -161,6 +162,11 @@ def run_ffmpeg(concat_path: str, out_mp4: str, *,
 
     cmd += ["-movflags", "+faststart", out_mp4]
 
+    if dry_run:
+        print("Dry-run ffmpeg command:")
+        print(" ".join(cmd))
+        return
+
     print("Running:", " ".join(cmd))
     if progress:
         run_ffmpeg_with_progress(cmd, float(total_out_seconds or 0.0))
@@ -201,6 +207,10 @@ def parse_args():
     # audio encode params
     p.add_argument("--audio-bitrate", default="96k")
     p.add_argument("--audio-channels", type=int, default=1)
+
+    # dry-run
+    p.add_argument("--dry-run", action="store_true", default=False,
+                   help="Print ffmpeg command without executing.")
 
     return p.parse_args()
 
@@ -273,9 +283,13 @@ def main():
         timelapse_audio=args.timelapse_audio,
         progress=args.progress,
         total_out_seconds=total_out_seconds,
+        dry_run=args.dry_run,
     )
 
-    print("DONE:", out_mp4)
+    if args.dry_run:
+        print("DRY-RUN complete (no video rendered).")
+    else:
+        print("DONE:", out_mp4)
 
 
 if __name__ == "__main__":

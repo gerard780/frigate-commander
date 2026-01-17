@@ -5,6 +5,15 @@
 # https://keepachangelog.com/en/1.1.0/
 
 ## 2026-01-17
+### Added
+- Add `--dry-run` flag to frigate_render.py and frigate_montage.py to validate without rendering.
+- Add `--labels-include` and `--labels-exclude` flags for custom label filtering.
+- Add troubleshooting section to README.md.
+
+### Changed
+- Update AGENTS.md to reflect current module structure.
+- Update ROADMAP.md with feature status and priorities.
+
 ### Fixed
 - Restore configurable `vod_url_template` in frigate_sources.py that was lost during utils extraction.
 
