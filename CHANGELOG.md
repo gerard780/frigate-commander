@@ -9,13 +9,18 @@
 - Add `--dry-run` flag to frigate_render.py and frigate_montage.py to validate without rendering.
 - Add `--labels-include` and `--labels-exclude` flags for custom label filtering.
 - Add troubleshooting section to README.md.
+- Add retry logic with exponential backoff to Frigate API calls (utils.api_get).
+- Add robust error handling to YouTube upload: token refresh, chunk retries, quota detection.
+- Add graceful handling for empty segments (no matching events or failed source resolution).
 
 ### Changed
 - Update AGENTS.md to reflect current module structure.
 - Update ROADMAP.md with feature status and priorities.
+- YouTube upload now uses 10MB chunks with resumable upload for reliability.
 
 ### Fixed
 - Restore configurable `vod_url_template` in frigate_sources.py that was lost during utils extraction.
+- Fix incorrect flag names in README (`--pre-pad`/`--post-pad`, not `--pre-padding`/`--post-padding`).
 
 ## 2025-12-31
 ### Added

@@ -1,29 +1,55 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import time
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError, ResumableUploadError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+
+# Retry settings
+MAX_RETRIES = 5
+RETRY_BACKOFF = 1.0  # Initial backoff in seconds
 
 
 def get_service(client_secret: str, token_path: str):
     creds = None
     if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        except Exception as e:
+            print(f"Warning: Could not load token file: {e}")
+            print("Will attempt to re-authorize...")
+            creds = None
 
     if creds and creds.expired and creds.refresh_token:
         print("Refreshing expired token...")
-        creds.refresh(Request())
-        with open(token_path, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
-        print("Token refreshed and saved.")
-    elif not creds or not creds.valid:
+        try:
+            creds.refresh(Request())
+            with open(token_path, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
+            print("Token refreshed and saved.")
+        except RefreshError as e:
+            print(f"Token refresh failed: {e}")
+            print("Token may be revoked. Deleting and re-authorizing...")
+            os.remove(token_path)
+            creds = None
+        except Exception as e:
+            print(f"Unexpected error refreshing token: {e}")
+            print("Deleting token and re-authorizing...")
+            os.remove(token_path)
+            creds = None
+
+    if not creds or not creds.valid:
+        if not os.path.exists(client_secret):
+            raise SystemExit(f"Client secret file not found: {client_secret}")
         flow = InstalledAppFlow.from_client_secrets_file(client_secret, SCOPES)
         creds = flow.run_local_server(port=0)
         os.makedirs(os.path.dirname(token_path), exist_ok=True)
@@ -47,26 +73,100 @@ def parse_args():
     return p.parse_args()
 
 
+def resumable_upload(request, retries=MAX_RETRIES, backoff=RETRY_BACKOFF):
+    """
+    Execute a resumable upload with retry logic.
+
+    Handles transient errors with exponential backoff.
+    """
+    response = None
+    retry_count = 0
+
+    while response is None:
+        try:
+            status, response = request.next_chunk()
+            if status:
+                print(f"Upload: {int(status.progress() * 100)}%")
+            retry_count = 0  # Reset on successful chunk
+        except HttpError as e:
+            if e.resp.status in (500, 502, 503, 504):
+                # Retryable server errors
+                if retry_count >= retries:
+                    raise SystemExit(f"Upload failed after {retries} retries: {e}")
+                delay = backoff * (2 ** retry_count)
+                print(f"Server error ({e.resp.status}), retrying in {delay:.1f}s... (attempt {retry_count + 1}/{retries})")
+                time.sleep(delay)
+                retry_count += 1
+            elif e.resp.status == 429:
+                # Rate limited
+                if retry_count >= retries:
+                    raise SystemExit(f"Upload rate limited after {retries} retries: {e}")
+                delay = backoff * (2 ** retry_count) * 2  # Longer delay for rate limit
+                print(f"Rate limited (429), retrying in {delay:.1f}s... (attempt {retry_count + 1}/{retries})")
+                time.sleep(delay)
+                retry_count += 1
+            elif e.resp.status == 403:
+                # Check for quota exceeded
+                error_reason = ""
+                if e.content:
+                    try:
+                        import json
+                        err = json.loads(e.content)
+                        error_reason = err.get("error", {}).get("errors", [{}])[0].get("reason", "")
+                    except Exception:
+                        pass
+                if error_reason == "quotaExceeded":
+                    raise SystemExit("YouTube API quota exceeded. Try again tomorrow.")
+                raise SystemExit(f"Upload forbidden (403): {e}")
+            elif e.resp.status == 401:
+                raise SystemExit("Upload unauthorized (401). Token may be invalid. Delete token and re-auth.")
+            else:
+                raise SystemExit(f"Upload failed with HTTP {e.resp.status}: {e}")
+        except ResumableUploadError as e:
+            if retry_count >= retries:
+                raise SystemExit(f"Resumable upload error after {retries} retries: {e}")
+            delay = backoff * (2 ** retry_count)
+            print(f"Upload error, retrying in {delay:.1f}s... (attempt {retry_count + 1}/{retries})")
+            time.sleep(delay)
+            retry_count += 1
+        except Exception as e:
+            # Network errors, timeouts, etc.
+            if retry_count >= retries:
+                raise SystemExit(f"Upload failed after {retries} retries: {e}")
+            delay = backoff * (2 ** retry_count)
+            print(f"Error ({type(e).__name__}), retrying in {delay:.1f}s... (attempt {retry_count + 1}/{retries})")
+            time.sleep(delay)
+            retry_count += 1
+
+    return response
+
+
 def main():
     args = parse_args()
+
+    # Validate file exists
+    if not os.path.exists(args.file):
+        raise SystemExit(f"Video file not found: {args.file}")
 
     service = get_service(args.client_secret, args.token)
     if args.dry_run:
         print("Dry run: authorized and ready to upload.")
         return
+
     body = {
         "snippet": {"title": args.title, "description": args.description, "tags": args.tags},
         "status": {"privacyStatus": args.privacy},
     }
-    media = MediaFileUpload(args.file, chunksize=-1, resumable=True)
+    media = MediaFileUpload(args.file, chunksize=10 * 1024 * 1024, resumable=True)  # 10MB chunks
     request = service.videos().insert(part="snippet,status", body=body, media_body=media)
 
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-        if status:
-            print(f"Upload: {int(status.progress() * 100)}%")
+    print(f"Uploading: {args.file}")
+    print(f"Title: {args.title}")
+
+    response = resumable_upload(request)
+    print("Upload complete!")
     print("Video ID:", response["id"])
+    print(f"URL: https://www.youtube.com/watch?v={response['id']}")
 
 
 if __name__ == "__main__":

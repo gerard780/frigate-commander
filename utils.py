@@ -12,12 +12,67 @@ from typing import List, Optional
 import requests
 
 
-def api_get(base_url: str, path: str, params=None, headers=None):
-    """Make a GET request to a Frigate API endpoint."""
+class ApiError(Exception):
+    """Raised when API request fails after retries."""
+    pass
+
+
+def api_get(base_url: str, path: str, params=None, headers=None,
+            retries: int = 3, backoff: float = 1.0, timeout: int = 60):
+    """
+    Make a GET request to a Frigate API endpoint with retry logic.
+
+    Args:
+        base_url: Frigate base URL
+        path: API path (e.g., /api/events)
+        params: Query parameters
+        headers: Optional headers
+        retries: Number of retry attempts (default 3)
+        backoff: Initial backoff delay in seconds (doubles each retry)
+        timeout: Request timeout in seconds
+
+    Raises:
+        ApiError: After all retries exhausted
+    """
     url = base_url.rstrip("/") + path
-    r = requests.get(url, params=params, headers=headers or {}, timeout=60)
-    r.raise_for_status()
-    return r.json()
+    last_error = None
+
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, params=params, headers=headers or {}, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt < retries:
+                delay = backoff * (2 ** attempt)
+                print(f"API timeout, retrying in {delay:.1f}s... (attempt {attempt + 1}/{retries})")
+                time.sleep(delay)
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            if attempt < retries:
+                delay = backoff * (2 ** attempt)
+                print(f"API connection error, retrying in {delay:.1f}s... (attempt {attempt + 1}/{retries})")
+                time.sleep(delay)
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 429:  # Rate limited
+                last_error = e
+                if attempt < retries:
+                    delay = backoff * (2 ** attempt) * 2  # Longer delay for rate limit
+                    print(f"API rate limited (429), retrying in {delay:.1f}s... (attempt {attempt + 1}/{retries})")
+                    time.sleep(delay)
+            elif status and 500 <= status < 600:  # Server error
+                last_error = e
+                if attempt < retries:
+                    delay = backoff * (2 ** attempt)
+                    print(f"API server error ({status}), retrying in {delay:.1f}s... (attempt {attempt + 1}/{retries})")
+                    time.sleep(delay)
+            else:
+                # 4xx errors (except 429) are not retryable
+                raise ApiError(f"API request failed: {e}") from e
+
+    raise ApiError(f"API request failed after {retries} retries: {last_error}") from last_error
 
 
 def vod_url(base_url: str, camera: str, start: int, end: int,

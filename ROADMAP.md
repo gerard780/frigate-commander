@@ -45,7 +45,7 @@
 
 ### High Priority
 - [ ] Unit tests (pytest) for window computation, label filtering, cadence logic
-- [ ] API retry logic with exponential backoff
+- [x] API retry logic with exponential backoff
 - [ ] Disk index caching across runs
 
 ### Medium Priority
@@ -66,6 +66,9 @@
 - [x] Add --dry-run mode
 - [x] Add --labels-include / --labels-exclude CLI flags
 - [x] Update documentation (AGENTS.md, ROADMAP.md, README.md)
+- [x] Add API retry logic with exponential backoff
+- [x] Add YouTube upload error handling (token refresh, chunk retries, quota detection)
+- [x] Add graceful empty segment handling with diagnostic output
 
 ### 2026-01-16
 - [x] Extract shared utils.py module

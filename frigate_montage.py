@@ -373,6 +373,25 @@ def main():
     )
     merged = frigate_segments.merge_segments(raw_segments, args.merge_gap)
 
+    # Handle empty segments case
+    if not merged:
+        print(f"No segments found for {args.camera} in window {start_local.isoformat()} -> {end_local.isoformat()}")
+        print(f"  Total events from API: {len(events)}")
+        print(f"  Events matching label filter: {len(filtered)}")
+        print(f"  Raw segments (before merge): {len(raw_segments)}")
+        if events and not filtered:
+            # Show what labels were seen
+            seen_labels = {}
+            for ev in events:
+                label = ev.get("label")
+                if label:
+                    seen_labels[label] = seen_labels.get(label, 0) + 1
+            print(f"  Labels seen: {dict(sorted(seen_labels.items(), key=lambda kv: (-kv[1], kv[0])))}")
+            print("  Hint: Use --labels-include to broaden filter or check Config.include_labels")
+        elif not events:
+            print("  Hint: Verify camera name, base URL, and time window")
+        raise SystemExit(0)  # Clean exit, not an error
+
     segdoc = {
         "camera": args.camera,
         "base_url": args.base_url.rstrip("/"),
@@ -453,13 +472,24 @@ def main():
     if args.source == "disk" and disk_failures:
         print("Disk-only: skipped unresolved segments (showing first 10).")
         for s, e, reason in disk_failures[:10]:
-            start_local = datetime.fromtimestamp(s, tz=utc).astimezone(tz)
-            end_local = datetime.fromtimestamp(e, tz=utc).astimezone(tz)
-            start_label = start_local.strftime("%Y-%m-%d %H:%M:%S %Z")
-            end_label = end_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+            start_local_ts = datetime.fromtimestamp(s, tz=utc).astimezone(tz)
+            end_local_ts = datetime.fromtimestamp(e, tz=utc).astimezone(tz)
+            start_label = start_local_ts.strftime("%Y-%m-%d %H:%M:%S %Z")
+            end_label = end_local_ts.strftime("%Y-%m-%d %H:%M:%S %Z")
             vod = frigate_sources.vod_url(segdoc["base_url"], args.camera, s, e)
             print(f"- {start_label} -> {end_label} ({s}-{e}) {reason}")
             print(f"  VOD: {vod}")
+
+    # Handle case where all segments failed to resolve
+    if not manifest_segments:
+        print(f"No segments could be resolved for {args.camera}")
+        print(f"  Segments requested: {len(segdoc['segments'])}")
+        print(f"  Source mode: {args.source}")
+        if args.source == "disk":
+            print(f"  Disk index files: {len(disk_index)}")
+            print(f"  Disk failures: {len(disk_failures)}")
+            print("  Hint: Try --source vod to use VOD URLs instead of disk files")
+        raise SystemExit(0)  # Clean exit
 
     manifest = {
         "camera": args.camera,
