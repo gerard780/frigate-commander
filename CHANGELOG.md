@@ -4,6 +4,10 @@
 # Format based on Keep a Changelog:
 # https://keepachangelog.com/en/1.1.0/
 
+## 2026-01-17
+### Fixed
+- Restore configurable `vod_url_template` in frigate_sources.py that was lost during utils extraction.
+
 ## 2025-12-31
 ### Added
 - Support multi-day windows in segment generation.

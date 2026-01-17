@@ -23,15 +23,21 @@ from typing import List, Tuple, Optional, Dict, Any
 
 import requests
 
-from utils import vod_url
+from utils import vod_url as _vod_url
 
 
 @dataclass
 class Config:
+    vod_url_template: str = "{base}/vod/{camera}/start/{start}/end/{end}/master.m3u8"
     default_recordings_path: str = "/home/gdupont/docker/frigate/storage/recordings"
     headers: dict = None  # optional auth headers
 
 CFG = Config()
+
+
+def vod_url(base_url: str, camera: str, start: int, end: int) -> str:
+    """Generate a VOD URL using CFG.vod_url_template."""
+    return _vod_url(base_url, camera, start, end, template=CFG.vod_url_template)
 
 
 def expand_path(p: str) -> str:
