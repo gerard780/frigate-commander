@@ -157,7 +157,7 @@ def main():
         "snippet": {"title": args.title, "description": args.description, "tags": args.tags},
         "status": {"privacyStatus": args.privacy},
     }
-    media = MediaFileUpload(args.file, chunksize=10 * 1024 * 1024, resumable=True)  # 10MB chunks
+    media = MediaFileUpload(args.file, chunksize=256 * 1024 * 1024, resumable=True)  # 256MB chunks
     request = service.videos().insert(part="snippet,status", body=body, media_body=media)
 
     print(f"Uploading: {args.file}")
