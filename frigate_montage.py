@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import frigate_segments
 import frigate_sources
 import frigate_render
+from utils import ApiError
 
 
 def parse_args():
@@ -341,11 +342,18 @@ def main():
     utc = ZoneInfo("UTC")
     after, before, start_local, end_local, window_tag, start_day, end_day = frigate_segments.compute_window(args, tz)
 
-    events = frigate_segments.api_get(
-        args.base_url, "/api/events",
-        params={"camera": args.camera, "after": after, "before": before, "limit": 5000},
-        headers=frigate_segments.CFG.headers
-    )
+    try:
+        events = frigate_segments.api_get(
+            args.base_url, "/api/events",
+            params={"camera": args.camera, "after": after, "before": before, "limit": 5000},
+            headers=frigate_segments.CFG.headers
+        )
+    except ApiError as e:
+        # Clean error message instead of stack trace
+        print(f"Error: Could not connect to Frigate at {args.base_url}")
+        print(f"  Ensure Frigate is running and accessible.")
+        print(f"  Details: {e}")
+        raise SystemExit(1)
     if not isinstance(events, list):
         raise SystemExit(f"Unexpected /api/events response: {type(events)}")
 
