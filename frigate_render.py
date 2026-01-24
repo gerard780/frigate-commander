@@ -79,6 +79,7 @@ def build_concat_entries(manifest: Dict[str, Any]) -> List[str]:
 def run_ffmpeg(concat_path: str, out_mp4: str, *,
               copy_mode: bool, copy_audio: bool,
               timelapse: Optional[float],
+              frame_sample: Optional[float],
               fps: int,
               preset: str,
               cq: int,
@@ -102,8 +103,8 @@ def run_ffmpeg(concat_path: str, out_mp4: str, *,
         "-i", concat_path,
     ]
 
-    # timelapse always encodes
-    if timelapse is not None:
+    # timelapse or frame-sample always encodes
+    if timelapse is not None or frame_sample is not None:
         copy_mode = False
         copy_audio = False
 
@@ -139,11 +140,16 @@ def run_ffmpeg(concat_path: str, out_mp4: str, *,
         else:
             raise SystemExit(f"Unsupported encoder: {encoder}")
 
-    if timelapse is not None:
+    if frame_sample is not None and frame_sample > 0:
+        # Frame sampling: select 1 frame per N seconds of source footage
+        # Using select filter then setpts to fix timestamps for smooth playback
+        cmd += ["-filter:v", f"select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,{frame_sample})',setpts=N/{fps}/TB"]
+    elif timelapse is not None:
+        # Traditional timelapse: keep all frames, compress timestamps
         cmd += ["-filter:v", f"setpts=PTS/{timelapse}"]
 
     # audio
-    if timelapse is not None and not timelapse_audio:
+    if (timelapse is not None or frame_sample is not None) and not timelapse_audio:
         cmd += ["-an"]
     else:
         if copy_mode and copy_audio:
@@ -189,7 +195,11 @@ def parse_args():
     p.add_argument("--copy-audio", action="store_true", default=CFG.default_copy_audio)
     p.add_argument("--encode", action="store_true", default=False)
 
-    p.add_argument("--timelapse", type=float, default=None)
+    p.add_argument("--timelapse", type=float, default=None,
+                   help="Speed multiplier using setpts (keeps all frames, compresses time)")
+    p.add_argument("--frame-sample", type=float, default=None, metavar="SECONDS",
+                   help="Frame sampling interval in seconds (e.g., 5 = 1 frame per 5 seconds). "
+                        "Alternative to --timelapse that samples frames instead of time-stretching.")
     p.add_argument("--timelapse-audio", action="store_true", default=False)
     p.add_argument("--progress", action="store_true", default=False)
 
@@ -229,7 +239,9 @@ def main():
     window_tag = manifest["window_tag"]
 
     suffix = window_tag
-    if args.timelapse is not None:
+    if args.frame_sample is not None:
+        suffix += f"-framesample{args.frame_sample}s"
+    elif args.timelapse is not None:
         suffix += f"-timelapse{args.timelapse}x"
 
     base_label = base_day
@@ -239,7 +251,11 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     # Decide actual mode
-    if args.timelapse is not None:
+    if args.frame_sample is not None:
+        copy_mode = False
+        copy_audio = False
+        mode_str = f"FRAME-SAMPLE {args.frame_sample}s (encode)"
+    elif args.timelapse is not None:
         copy_mode = False
         copy_audio = False
         mode_str = f"TIMELAPSE {args.timelapse}x (encode)"
@@ -261,7 +277,10 @@ def main():
     print(f"Concat:  {concat_path} entries={len(concat_entries)}")
 
     total_out_seconds = sum([int(s["end"]) - int(s["start"]) for s in manifest["segments"]])
-    if args.timelapse is not None:
+    if args.frame_sample is not None:
+        # Frame sampling: output duration = (source_seconds / frame_sample_interval) / fps
+        total_out_seconds = (total_out_seconds / args.frame_sample) / float(args.fps)
+    elif args.timelapse is not None:
         total_out_seconds = total_out_seconds / float(args.timelapse)
 
     run_ffmpeg(
@@ -270,6 +289,7 @@ def main():
         copy_mode=copy_mode and not args.encode,
         copy_audio=copy_audio,
         timelapse=args.timelapse,
+        frame_sample=args.frame_sample,
         fps=args.fps,
         preset=args.preset,
         cq=args.cq,

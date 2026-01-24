@@ -70,6 +70,25 @@ python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 
 # Software encode (libx265) with CRF.
 python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 3 --timelapse 50 --encoder libx265 --crf 23
 
+Fast Frame Sampling Timelapse
+-----------------------------
+For long periods (days/weeks/months), use `--sample-interval` for much faster processing:
+```bash
+# 1 frame per 30 seconds (fast, good for multi-day)
+python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 7 --sample-interval 30 --encoder hevc_nvenc --fps 30
+
+# 1 frame per minute (very fast, good for weeks/months)
+python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 30 --sample-interval 60 --encoder hevc_nvenc --fps 30
+
+# Multi-day dawntodusk (daytime only from each day)
+python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 7 --dawntodusk --sample-interval 30 --encoder hevc_nvenc --fps 30
+
+# Multi-day dusktodawn (nighttime only from each day)
+python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 7 --dusktodawn --sample-interval 30 --encoder hevc_nvenc --fps 30
+```
+
+Frame caching is enabled by default (stored in `montages/frame_cache`). Subsequent runs with overlapping time ranges will reuse cached frames.
+
 Motion-Only VLC Playlist (Review API)
 -------------------------------------
 # Generates an M3U from motion-only review items (no detection).

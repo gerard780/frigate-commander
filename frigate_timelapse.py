@@ -14,10 +14,30 @@ from datetime import datetime
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
+from datetime import timedelta
+from astral import LocationInfo
+from astral.sun import dawn, dusk
+
 import frigate_segments
 import frigate_sources
 import frigate_render
+import atexit
+import shutil
+import sys
+import tempfile
 from utils import atempo_chain_for_speed, format_duration, run_ffmpeg_with_progress
+
+
+def _restore_terminal():
+    """Restore terminal settings on exit (fixes ffmpeg/subprocess issues)."""
+    if sys.stdin.isatty():
+        try:
+            subprocess.run(["stty", "sane"], stdin=sys.stdin, check=False)
+        except Exception:
+            pass
+
+
+atexit.register(_restore_terminal)
 
 
 @dataclass
@@ -34,6 +54,241 @@ CFG = Config()
 
 def build_concat_entries(files: List[str]) -> List[str]:
     return [f"file '{p}'\n" for p in files]
+
+
+def compute_sun_windows(start_day, end_day, mode: str, latitude: float, longitude: float, tz) -> List[tuple]:
+    """
+    Compute dawn/dusk windows for each day in range.
+
+    Args:
+        start_day: Start date
+        end_day: End date (inclusive)
+        mode: 'dawntodusk' or 'dusktodawn'
+        latitude, longitude: Location for sun calculations
+        tz: Timezone
+
+    Returns:
+        List of (start_ts, end_ts) tuples for valid time windows
+    """
+    from datetime import date as date_cls
+
+    loc = LocationInfo(
+        name="Location",
+        region="",
+        timezone=str(tz),
+        latitude=latitude,
+        longitude=longitude,
+    )
+
+    windows = []
+    current = start_day
+
+    while current <= end_day:
+        try:
+            if mode == 'dawntodusk':
+                # Daytime: dawn to dusk on same day
+                start_dt = dawn(loc.observer, date=current, tzinfo=tz)
+                end_dt = dusk(loc.observer, date=current, tzinfo=tz)
+            else:
+                # Nighttime: dusk today to dawn tomorrow
+                start_dt = dusk(loc.observer, date=current, tzinfo=tz)
+                end_dt = dawn(loc.observer, date=current + timedelta(days=1), tzinfo=tz)
+
+            windows.append((int(start_dt.timestamp()), int(end_dt.timestamp())))
+        except Exception:
+            pass  # Skip days with calculation errors (polar regions)
+
+        current += timedelta(days=1)
+
+    return windows
+
+
+def is_in_sun_windows(ts: int, windows: List[tuple]) -> bool:
+    """Check if a timestamp falls within any of the sun windows."""
+    for start_ts, end_ts in windows:
+        if start_ts <= ts < end_ts:
+            return True
+    return False
+
+
+def _parse_cache_path_from_recording(file_path: str, cache_dir: str) -> Optional[str]:
+    """
+    Parse recording path to generate a timestamp-based cache path.
+    Frigate recordings: .../YYYY-MM-DD/HH/camera/MM.SS.mp4
+    Cache structure: cache_dir/camera/YYYY-MM-DD/HH-MM-SS.webp
+    """
+    import re
+    # Match Frigate recording path pattern
+    match = re.search(r'/(\d{4}-\d{2}-\d{2})/(\d{2})/([^/]+)/(\d{2})\.(\d{2})\.mp4$', file_path)
+    if match:
+        date, hour, camera, minute, second = match.groups()
+        return os.path.join(cache_dir, camera, date, f"{hour}-{minute}-{second}.webp")
+    # Fallback to hash-based for non-standard paths
+    import hashlib
+    cache_key = hashlib.md5(file_path.encode()).hexdigest()
+    return os.path.join(cache_dir, "_other", f"{cache_key}.webp")
+
+
+def _extract_one_frame(args):
+    """Worker function for parallel frame extraction."""
+    idx, path, out_dir, cache_dir = args
+    out_path = os.path.join(out_dir, f"{idx:08d}.webp")
+
+    # Check cache first
+    cache_path = None
+    if cache_dir:
+        cache_path = _parse_cache_path_from_recording(path, cache_dir)
+        if cache_path and os.path.exists(cache_path):
+            # Copy from cache
+            try:
+                shutil.copy2(cache_path, out_path)
+                return (True, "cached")
+            except Exception:
+                pass  # Fall through to extraction
+
+    # Extract frame as WebP (~30% smaller than JPEG at similar quality)
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+           "-i", path, "-frames:v", "1", "-quality", "85", out_path]
+    try:
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode == 0 and os.path.exists(out_path):
+            # Save to cache if enabled
+            if cache_dir and cache_path:
+                try:
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                    shutil.copy2(out_path, cache_path)
+                except Exception:
+                    pass  # Cache write failure is non-fatal
+            return (True, "extracted")
+        return (False, "failed")
+    except Exception:
+        return (False, "error")
+
+
+def extract_first_frames(files: List[str], out_dir: str, cache_dir: Optional[str] = None) -> int:
+    """
+    Extract the first frame from each file to an image sequence.
+    Uses parallel processing for speed.
+    If cache_dir is provided, reuses previously extracted frames.
+    Returns the number of successfully extracted frames.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    os.makedirs(out_dir, exist_ok=True)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    total = len(files)
+
+    # Prepare work items
+    work = [(idx, path, out_dir, cache_dir) for idx, path in enumerate(files)]
+
+    # Use process pool - more workers = faster, but don't overwhelm I/O
+    max_workers = min(16, (os.cpu_count() or 4) * 2)
+    cache_status = f", cache={cache_dir}" if cache_dir else ""
+    print(f"Extracting first frame from {total} files (workers={max_workers}{cache_status})...")
+
+    success = 0
+    cached = 0
+    done = 0
+    succeeded_indices = []
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_extract_one_frame, w): w[0] for w in work}
+        for future in as_completed(futures):
+            done += 1
+            idx = futures[future]
+            ok, status = future.result()
+            if ok:
+                success += 1
+                succeeded_indices.append(idx)
+                if status == "cached":
+                    cached += 1
+            if done % 500 == 0 or done == total:
+                cache_info = f", cached={cached}" if cache_dir else ""
+                print(f"  Progress: {done}/{total} (success={success}{cache_info})")
+
+    # Renumber files to be sequential (required for ffmpeg image2 demuxer)
+    if succeeded_indices:
+        succeeded_indices.sort()
+        print(f"  Renumbering {len(succeeded_indices)} frames to sequential...")
+        for new_idx, old_idx in enumerate(succeeded_indices):
+            old_path = os.path.join(out_dir, f"{old_idx:08d}.webp")
+            new_path = os.path.join(out_dir, f"frame_{new_idx:08d}.webp")
+            if os.path.exists(old_path):
+                os.rename(old_path, new_path)
+
+    if cache_dir and cached > 0:
+        print(f"  Cache hits: {cached}/{success} frames reused")
+
+    return success
+
+
+def encode_image_sequence(img_dir: str, out_mp4: str, *,
+                          fps: int,
+                          encoder: str,
+                          preset: str,
+                          cq: Optional[int],
+                          crf: Optional[int],
+                          maxrate: Optional[str],
+                          bufsize: Optional[str],
+                          scale: Optional[str],
+                          spatial_aq: bool,
+                          temporal_aq: bool,
+                          aq_strength: Optional[int]):
+    """Encode an image sequence (numbered WebP images) to video."""
+    pattern = os.path.join(img_dir, "frame_%08d.webp")
+
+    cmd = ["ffmpeg", "-y", "-hide_banner"]
+    cmd += [
+        "-framerate", str(fps),
+        "-i", pattern,
+    ]
+
+    # Video filter for scaling if needed
+    vf_parts = []
+    if scale:
+        vf_parts.append(f"scale={scale}")
+    if vf_parts:
+        cmd += ["-filter:v", ",".join(vf_parts)]
+
+    # Encoder settings
+    if encoder in ("hevc_nvenc", "h264_nvenc"):
+        cmd += [
+            "-c:v", encoder,
+            "-preset", preset,
+            "-rc:v", "vbr_hq",
+        ]
+        if cq is not None:
+            cmd += ["-cq:v", str(cq)]
+        if spatial_aq:
+            cmd += ["-spatial-aq", "1"]
+            if aq_strength is not None:
+                cmd += ["-aq-strength", str(aq_strength)]
+        if temporal_aq:
+            cmd += ["-temporal-aq", "1"]
+        cmd += ["-b:v", "0"]
+        if maxrate:
+            cmd += ["-maxrate:v", str(maxrate)]
+        if bufsize:
+            cmd += ["-bufsize:v", str(bufsize)]
+    elif encoder in ("libx265", "libx264"):
+        cmd += [
+            "-c:v", encoder,
+            "-preset", preset,
+        ]
+        if crf is not None:
+            cmd += ["-crf", str(crf)]
+    else:
+        cmd += ["-c:v", encoder]
+
+    cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", out_mp4]
+
+    print(f"Encoding {out_mp4}...")
+    print("Running:", " ".join(cmd))
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise SystemExit("ffmpeg encoding failed")
 
 
 def parse_bitrate(value: str) -> int:
@@ -112,6 +367,8 @@ def estimate_bitrate_bps(width: int, height: int, fps: float, encoder: str,
 
 def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
                      timelapse: float,
+                     frame_sample: Optional[float],
+                     sample_interval: Optional[float],
                      fps: int,
                      encoder: str,
                      preset: str,
@@ -128,7 +385,21 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
                      qsv_device: Optional[str],
                      vaapi_device: Optional[str]):
     def build_video_filter(use_hw_upload: bool, use_cuda_scale: bool) -> str:
-        parts = [f"setpts=PTS/{timelapse}"]
+        parts = []
+        if sample_interval is not None and sample_interval > 0:
+            # FAST segment-level sampling: files already filtered, just take first frame of each
+            # This is much faster as we skip entire files and only decode first frame
+            parts.append("select='eq(n\\,0)'")
+            parts.append(f"setpts=N/{fps}/TB")
+        elif frame_sample is not None and frame_sample > 0:
+            # Frame sampling: select 1 frame per N seconds of source footage
+            # Using select filter (faster than fps filter - can skip decode on some codecs)
+            # then setpts to fix timestamps for smooth playback at target fps
+            parts.append(f"select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,{frame_sample})'")
+            parts.append(f"setpts=N/{fps}/TB")
+        else:
+            # Traditional timelapse: keep all frames, compress timestamps
+            parts.append(f"setpts=PTS/{timelapse}")
         if scale:
             if use_cuda_scale:
                 parts.append(f"scale_npp={scale}")
@@ -254,7 +525,20 @@ def parse_args():
     p.add_argument("--out-file", default=None)
 
     # timelapse / encode
-    p.add_argument("--timelapse", type=float, default=CFG.default_timelapse)
+    p.add_argument("--timelapse", type=float, default=CFG.default_timelapse,
+                   help="Speed multiplier using setpts (keeps all frames, compresses time)")
+    p.add_argument("--frame-sample", type=float, default=None, metavar="SECONDS",
+                   help="Frame sampling interval in seconds (e.g., 5 = 1 frame per 5 seconds). "
+                        "Alternative to --timelapse that samples frames instead of time-stretching.")
+    p.add_argument("--sample-interval", type=float, default=None, metavar="SECONDS",
+                   help="FAST segment-level sampling: select 1 file per N seconds, take first frame. "
+                        "Much faster than --frame-sample for long periods (days/weeks/months). "
+                        "E.g., --sample-interval 60 = 1 frame per minute.")
+    p.add_argument("--frame-cache", default=None, metavar="DIR",
+                   help="Directory to cache extracted frames. Reuses frames from previous runs "
+                        "for overlapping time ranges. Default: {out-dir}/frame_cache when using --sample-interval")
+    p.add_argument("--no-frame-cache", action="store_true", default=False,
+                   help="Disable frame caching (not recommended)")
     p.add_argument("--fps", type=int, default=CFG.default_fps)
     p.add_argument("--encoder", default=CFG.default_encoder,
                    choices=["hevc_nvenc", "h264_nvenc", "hevc_qsv", "h264_qsv", "hevc_vaapi", "h264_vaapi", "libx265", "libx264"])
@@ -307,11 +591,53 @@ def main():
     if not disk_index:
         raise SystemExit(disk_err or "no recordings found")
 
-    files = [p for (ts, p) in disk_index if after <= ts < before]
-    if not files:
+    # Filter files within time window
+    files_with_ts = [(ts, p) for (ts, p) in disk_index if after <= ts < before]
+    if not files_with_ts:
         raise SystemExit("no recordings within requested window")
 
+    # For multi-day dawn/dusk windows, filter to only include valid sun periods
+    is_multiday = (end_day != start_day)
+    if is_multiday and (args.dawntodusk or args.dusktodawn):
+        mode = 'dawntodusk' if args.dawntodusk else 'dusktodawn'
+        sun_windows = compute_sun_windows(
+            start_day, end_day, mode,
+            args.latitude, args.longitude, tz
+        )
+        before_count = len(files_with_ts)
+        files_with_ts = [(ts, p) for (ts, p) in files_with_ts if is_in_sun_windows(ts, sun_windows)]
+        if not files_with_ts:
+            raise SystemExit(f"no recordings within {mode} windows")
+        print(f"Sun filter ({mode}): {len(files_with_ts)}/{before_count} files in {len(sun_windows)} windows")
+
+    # For segment-level sampling (--sample-interval), select files at intervals
+    if args.sample_interval is not None and args.sample_interval > 0:
+        interval = args.sample_interval
+        # Group files by which interval bucket they fall into (aligned to start time)
+        # This ensures larger intervals are always subsets of smaller ones
+        # e.g., 20s picks buckets 0,1,2,3,4,5... and 60s picks buckets 0,3,6...
+        buckets = {}
+        for ts, p in files_with_ts:
+            bucket = int((ts - after) // interval)
+            if bucket not in buckets:
+                buckets[bucket] = (ts, p)  # Keep first file in each bucket
+        # Sort by bucket and extract files
+        files = [p for bucket, (ts, p) in sorted(buckets.items())]
+        total_files = len(files_with_ts)
+        print(f"Segment sampling: {len(files)}/{total_files} files (1 per {args.sample_interval}s)")
+    else:
+        files = [p for (ts, p) in files_with_ts]
+
+    if not files:
+        raise SystemExit("no files after sampling filter")
+
     os.makedirs(args.out_dir, exist_ok=True)
+
+    # Default frame cache to {out_dir}/frame_cache when using --sample-interval
+    frame_cache = args.frame_cache
+    if args.sample_interval is not None and not args.no_frame_cache:
+        if frame_cache is None:
+            frame_cache = os.path.join(args.out_dir, "frame_cache")
     concat_path = frigate_render.write_concat_file(args.out_dir, args.camera, build_concat_entries(files))
 
     base_label = start_day.isoformat()
@@ -319,7 +645,11 @@ def main():
         base_label = f"{start_day.isoformat()}_to_{end_day.isoformat()}"
 
     suffix = window_tag
-    if args.timelapse is not None:
+    if args.sample_interval is not None:
+        suffix += f"-sample{args.sample_interval}s"
+    elif args.frame_sample is not None:
+        suffix += f"-framesample{args.frame_sample}s"
+    elif args.timelapse is not None:
         suffix += f"-timelapse{args.timelapse}x"
 
     out_mp4 = args.out_file or os.path.join(args.out_dir, f"{args.camera}-timelapse-{base_label}-{suffix}.mp4")
@@ -349,6 +679,8 @@ def main():
         concat_path,
         out_mp4,
         timelapse=float(args.timelapse),
+        frame_sample=args.frame_sample,
+        sample_interval=args.sample_interval,
         fps=int(args.fps),
         encoder=args.encoder,
         preset=preset,
@@ -367,7 +699,20 @@ def main():
     )
 
     window_seconds = max(0, before - after)
-    output_seconds = window_seconds / float(args.timelapse)
+    if args.sample_interval is not None:
+        # Segment-level sampling: 1 frame per file, output = num_files / fps
+        output_seconds = len(files) / float(args.fps)
+        # Progress based on output (fast mode processes quickly)
+        progress_seconds = output_seconds
+    elif args.frame_sample is not None:
+        # Frame sampling: output duration = (window_seconds / frame_sample_interval) / fps
+        output_seconds = (window_seconds / args.frame_sample) / float(args.fps)
+        # For progress tracking, use INPUT duration since that's what's being processed
+        progress_seconds = window_seconds
+    else:
+        # Traditional timelapse: output duration = window_seconds / timelapse_factor
+        output_seconds = window_seconds / float(args.timelapse)
+        progress_seconds = output_seconds
     estimate_bitrate = args.estimate_bitrate or args.maxrate
     estimate_note = None
     bitrate_bps = None
@@ -392,12 +737,16 @@ def main():
     print(f"Camera:  {args.camera}")
     print(f"Window:  {start_local.isoformat()} -> {end_local.isoformat()} ({window_tag})")
     print(f"Files:   {len(files)} cadence≈{cadence}s")
-    print(f"Concat:  {concat_path}")
     print(f"Output:  {out_mp4}")
-    print(f"Codec:   {args.encoder} preset={preset} timelapse={args.timelapse}x fps={args.fps}")
+    if args.sample_interval is not None:
+        print(f"Codec:   {args.encoder} preset={preset} sample-interval={args.sample_interval}s fps={args.fps}")
+    elif args.frame_sample is not None:
+        print(f"Codec:   {args.encoder} preset={preset} frame-sample={args.frame_sample}s fps={args.fps}")
+    else:
+        print(f"Codec:   {args.encoder} preset={preset} timelapse={args.timelapse}x fps={args.fps}")
     if args.scale:
         print(f"Scale:   {args.scale}")
-    if args.cuda and args.encoder in ("hevc_nvenc", "h264_nvenc"):
+    if args.cuda and args.encoder in ("hevc_nvenc", "h264_nvenc") and args.sample_interval is None:
         print("CUDA:    enabled (decode + scale_npp)")
     if spatial_aq or temporal_aq:
         aq_bits = []
@@ -408,7 +757,39 @@ def main():
         print("AQ:      " + ", ".join(aq_bits))
     print(estimate_line)
 
-    run_ffmpeg_with_progress(cmd, output_seconds)
+    # Use two-pass approach for sample_interval (MUCH faster)
+    if args.sample_interval is not None:
+        # Create temp directory for frame extraction
+        tmp_dir = tempfile.mkdtemp(prefix="timelapse_frames_")
+        try:
+            # Pass 1: Extract first frame from each file (parallel, fast)
+            extracted = extract_first_frames(files, tmp_dir, cache_dir=frame_cache)
+            if extracted == 0:
+                raise SystemExit("No frames extracted")
+            print(f"Extracted {extracted} frames")
+
+            # Pass 2: Encode image sequence to video
+            encode_image_sequence(
+                tmp_dir, out_mp4,
+                fps=int(args.fps),
+                encoder=args.encoder,
+                preset=preset,
+                cq=cq,
+                crf=crf,
+                maxrate=args.maxrate,
+                bufsize=args.bufsize,
+                scale=args.scale,
+                spatial_aq=spatial_aq,
+                temporal_aq=temporal_aq,
+                aq_strength=aq_strength,
+            )
+        finally:
+            # Cleanup temp directory
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    else:
+        # Traditional single-pass approach
+        print(f"Concat:  {concat_path}")
+        run_ffmpeg_with_progress(cmd, progress_seconds)
 
     print("DONE:", out_mp4)
 

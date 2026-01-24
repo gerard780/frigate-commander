@@ -4,6 +4,27 @@
 # Format based on Keep a Changelog:
 # https://keepachangelog.com/en/1.1.0/
 
+## 2026-01-24
+### Added
+- Add `--sample-interval` for fast segment-level frame sampling timelapses.
+  - Extracts first frame from each selected file (parallel processing with 16 workers).
+  - Much faster than `--timelapse` for long periods (days/weeks/months).
+  - Bucket-based selection ensures larger intervals are subsets of smaller ones.
+- Add `--frame-sample` for frame-level sampling (1 frame per N seconds).
+- Add `--frame-cache` for persistent frame caching across runs.
+  - Defaults to `{out-dir}/frame_cache` when using `--sample-interval`.
+  - Stores frames as WebP (~30% smaller than JPEG).
+  - Timestamp-based paths: `cache/camera/YYYY-MM-DD/HH-MM-SS.webp`.
+  - Overlapping time ranges reuse cached frames automatically.
+- Add `--no-frame-cache` to disable caching if needed.
+- Add terminal restoration on exit (fixes ffmpeg leaving terminal in bad state).
+- Add multi-day dawn/dusk filtering for timelapses.
+  - `--dawntodusk` with multi-day now only includes daytime periods from each day.
+  - `--dusktodawn` with multi-day now only includes nighttime periods from each day.
+
+### Changed
+- Frame extraction now uses WebP format for better compression.
+
 ## 2026-01-17
 ### Added
 - Add `--dry-run` flag to frigate_render.py and frigate_montage.py to validate without rendering.
