@@ -4,6 +4,19 @@
 # Format based on Keep a Changelog:
 # https://keepachangelog.com/en/1.1.0/
 
+## 2026-01-25
+### Added
+- Add `--dawn-offset` and `--dusk-offset` to adjust sun times by minutes.
+  - E.g., `--dusk-offset -30` ends timelapse 30 minutes before sunset.
+- Add rolling window ETA for frame extraction (based on last 5000 files for accuracy).
+- Add total extraction time display on completion.
+- Add two-stage Ctrl+C interrupt handling:
+  - First Ctrl+C: finish current tasks, cancel pending.
+  - Second Ctrl+C: force quit immediately.
+- Add `--no-browser` flag to YouTube upload for remote terminals.
+  - Prints auth URL instead of opening browser.
+  - User pastes redirect URL to complete OAuth flow.
+
 ## 2026-01-24
 ### Added
 - Add `--sample-interval` for fast segment-level frame sampling timelapses.

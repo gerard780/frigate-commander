@@ -19,7 +19,7 @@ MAX_RETRIES = 5
 RETRY_BACKOFF = 1.0  # Initial backoff in seconds
 
 
-def get_service(client_secret: str, token_path: str):
+def get_service(client_secret: str, token_path: str, no_browser: bool = False):
     creds = None
     if os.path.exists(token_path):
         try:
@@ -51,7 +51,37 @@ def get_service(client_secret: str, token_path: str):
         if not os.path.exists(client_secret):
             raise SystemExit(f"Client secret file not found: {client_secret}")
         flow = InstalledAppFlow.from_client_secrets_file(client_secret, SCOPES)
-        creds = flow.run_local_server(port=0)
+        if no_browser:
+            # Manual flow for remote terminals
+            import urllib.parse
+            # Let Google choose the redirect port (matches Desktop app behavior)
+            redirect_uri = "http://localhost:8085/"
+            flow.redirect_uri = redirect_uri
+            auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+            print("\n" + "=" * 60)
+            print("STEP 1: Visit this URL to authorize:")
+            print(auth_url)
+            print("=" * 60)
+            print("\nSTEP 2: After authorizing, you'll be redirected to a localhost URL")
+            print("        (the page will fail to load - that's OK!)")
+            print("\nSTEP 3: Copy the FULL URL from your browser's address bar")
+            print("        and paste it below.\n")
+            redirect_response = input("Paste redirect URL: ").strip()
+            # Extract code from URL
+            parsed = urllib.parse.urlparse(redirect_response)
+            params = urllib.parse.parse_qs(parsed.query)
+            if "code" not in params:
+                raise SystemExit("No authorization code found in URL. Make sure you copied the full URL.")
+            code = params["code"][0]
+            # Extract redirect_uri from the pasted URL to ensure it matches
+            actual_redirect = f"{parsed.scheme}://{parsed.netloc}/"
+            flow.redirect_uri = actual_redirect
+            print(f"Exchanging code for token...")
+            flow.fetch_token(code=code)
+            creds = flow.credentials
+            print("Authorization successful!")
+        else:
+            creds = flow.run_local_server(port=0)
         os.makedirs(os.path.dirname(token_path), exist_ok=True)
         with open(token_path, "w", encoding="utf-8") as f:
             f.write(creds.to_json())
@@ -70,6 +100,8 @@ def parse_args():
     p.add_argument("--privacy", default="unlisted", choices=["private", "unlisted", "public"])
     p.add_argument("--dry-run", action="store_true", default=False,
                    help="Authorize and validate inputs without uploading.")
+    p.add_argument("--no-browser", action="store_true", default=False,
+                   help="Don't open browser for auth. Just print URL (for remote terminals).")
     return p.parse_args()
 
 
@@ -148,7 +180,7 @@ def main():
     if not os.path.exists(args.file):
         raise SystemExit(f"Video file not found: {args.file}")
 
-    service = get_service(args.client_secret, args.token)
+    service = get_service(args.client_secret, args.token, no_browser=args.no_browser)
     if args.dry_run:
         print("Dry run: authorized and ready to upload.")
         return

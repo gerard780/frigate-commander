@@ -85,6 +85,9 @@ python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 
 
 # Multi-day dusktodawn (nighttime only from each day)
 python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 7 --dusktodawn --sample-interval 30 --encoder hevc_nvenc --fps 30
+
+# Adjust dawn/dusk times with offsets (minutes)
+python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 7 --dawntodusk --dusk-offset -30 --sample-interval 30 --encoder hevc_nvenc --fps 30
 ```
 
 Frame caching is enabled by default (stored in `montages/frame_cache`). Subsequent runs with overlapping time ranges will reuse cached frames.
@@ -104,6 +107,9 @@ python3 scripts/youtube_upload.py --client-secret ./client_secret.json --token .
 
 # Authorize a new account (creates a new token file).
 python3 scripts/youtube_upload.py --client-secret ./client_secret.json --token ./tokens/account2.json --file ./montages/TapoC560WS-animals-2025-12-30-dusktodawn.mp4 --title "Auth check" --dry-run
+
+# Remote terminal (no browser available): prints URL instead of opening browser.
+python3 scripts/youtube_upload.py --client-secret ./client_secret.json --token ./tokens/account1.json --file ./montages/video.mp4 --title "Test" --no-browser --dry-run
 
 Cron Wrapper (nightly export + upload)
 --------------------------------------

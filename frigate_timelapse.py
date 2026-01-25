@@ -56,7 +56,8 @@ def build_concat_entries(files: List[str]) -> List[str]:
     return [f"file '{p}'\n" for p in files]
 
 
-def compute_sun_windows(start_day, end_day, mode: str, latitude: float, longitude: float, tz) -> List[tuple]:
+def compute_sun_windows(start_day, end_day, mode: str, latitude: float, longitude: float, tz,
+                        dawn_offset: int = 0, dusk_offset: int = 0) -> List[tuple]:
     """
     Compute dawn/dusk windows for each day in range.
 
@@ -66,6 +67,8 @@ def compute_sun_windows(start_day, end_day, mode: str, latitude: float, longitud
         mode: 'dawntodusk' or 'dusktodawn'
         latitude, longitude: Location for sun calculations
         tz: Timezone
+        dawn_offset: Minutes to add to dawn time (positive = later)
+        dusk_offset: Minutes to add to dusk time (positive = later)
 
     Returns:
         List of (start_ts, end_ts) tuples for valid time windows
@@ -87,12 +90,12 @@ def compute_sun_windows(start_day, end_day, mode: str, latitude: float, longitud
         try:
             if mode == 'dawntodusk':
                 # Daytime: dawn to dusk on same day
-                start_dt = dawn(loc.observer, date=current, tzinfo=tz)
-                end_dt = dusk(loc.observer, date=current, tzinfo=tz)
+                start_dt = dawn(loc.observer, date=current, tzinfo=tz) + timedelta(minutes=dawn_offset)
+                end_dt = dusk(loc.observer, date=current, tzinfo=tz) + timedelta(minutes=dusk_offset)
             else:
                 # Nighttime: dusk today to dawn tomorrow
-                start_dt = dusk(loc.observer, date=current, tzinfo=tz)
-                end_dt = dawn(loc.observer, date=current + timedelta(days=1), tzinfo=tz)
+                start_dt = dusk(loc.observer, date=current, tzinfo=tz) + timedelta(minutes=dusk_offset)
+                end_dt = dawn(loc.observer, date=current + timedelta(days=1), tzinfo=tz) + timedelta(minutes=dawn_offset)
 
             windows.append((int(start_dt.timestamp()), int(end_dt.timestamp())))
         except Exception:
@@ -172,6 +175,8 @@ def extract_first_frames(files: List[str], out_dir: str, cache_dir: Optional[str
     If cache_dir is provided, reuses previously extracted frames.
     Returns the number of successfully extracted frames.
     """
+    import signal
+    import time
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     os.makedirs(out_dir, exist_ok=True)
@@ -192,21 +197,84 @@ def extract_first_frames(files: List[str], out_dir: str, cache_dir: Optional[str
     cached = 0
     done = 0
     succeeded_indices = []
+    start_time = time.monotonic()
+    interrupt_count = [0]  # Use list to avoid issues with nested scope
+    # Rolling window for accurate ETA (track last N timestamps)
+    window_size = 500
+    window_times = []  # (done_count, timestamp) pairs
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_extract_one_frame, w): w[0] for w in work}
-        for future in as_completed(futures):
-            done += 1
-            idx = futures[future]
-            ok, status = future.result()
-            if ok:
-                success += 1
-                succeeded_indices.append(idx)
-                if status == "cached":
-                    cached += 1
-            if done % 500 == 0 or done == total:
-                cache_info = f", cached={cached}" if cache_dir else ""
-                print(f"  Progress: {done}/{total} (success={success}{cache_info})")
+    def handle_interrupt(signum, frame):
+        interrupt_count[0] += 1
+        if interrupt_count[0] == 1:
+            print("\n  Stopping after current tasks... (Ctrl+C again to force quit)")
+        elif interrupt_count[0] == 2:
+            print("\n  Force quitting...")
+        # Ignore additional Ctrl+C presses
+
+    # Set up interrupt handler
+    original_handler = signal.signal(signal.SIGINT, handle_interrupt)
+
+    try:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_extract_one_frame, w): w[0] for w in work}
+            for future in as_completed(futures):
+                if interrupt_count[0] >= 2:
+                    # Force stop - cancel everything immediately
+                    for f in futures:
+                        f.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+
+                done += 1
+                idx = futures[future]
+                try:
+                    ok, status = future.result(timeout=0.1)
+                    if ok:
+                        success += 1
+                        succeeded_indices.append(idx)
+                        if status == "cached":
+                            cached += 1
+                except Exception:
+                    pass
+
+                # Stop after current batch if gracefully interrupted
+                if interrupt_count[0] == 1:
+                    # Cancel pending futures
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
+                    break
+
+                if done % 500 == 0 or done == total:
+                    now = time.monotonic()
+                    window_times.append((done, now))
+                    # Keep only recent entries for rolling window
+                    while len(window_times) > 10:
+                        window_times.pop(0)
+
+                    # Calculate rate from rolling window
+                    if len(window_times) >= 2:
+                        oldest_done, oldest_time = window_times[0]
+                        newest_done, newest_time = window_times[-1]
+                        window_elapsed = newest_time - oldest_time
+                        window_count = newest_done - oldest_done
+                        rate = window_count / window_elapsed if window_elapsed > 0 else 0
+                    else:
+                        # Fallback to overall rate for first window
+                        elapsed = now - start_time
+                        rate = done / elapsed if elapsed > 0 else 0
+
+                    remaining = (total - done) / rate if rate > 0 else 0
+                    eta = format_duration(remaining)
+                    cache_info = f", cached={cached}" if cache_dir else ""
+                    print(f"  Progress: {done}/{total} (success={success}{cache_info}) ETA: {eta}")
+    finally:
+        # Restore original handler
+        signal.signal(signal.SIGINT, original_handler)
+
+    if interrupt_count[0] > 0:
+        print(f"  Stopped. Extracted {success} frames.")
+        raise SystemExit(1)
 
     # Renumber files to be sequential (required for ffmpeg image2 demuxer)
     if succeeded_indices:
@@ -220,6 +288,9 @@ def extract_first_frames(files: List[str], out_dir: str, cache_dir: Optional[str
 
     if cache_dir and cached > 0:
         print(f"  Cache hits: {cached}/{success} frames reused")
+
+    total_time = time.monotonic() - start_time
+    print(f"  Completed in {format_duration(total_time)} ({success} frames)")
 
     return success
 
@@ -519,6 +590,11 @@ def parse_args():
     # location for dawn/dusk
     p.add_argument("--latitude", type=float, default=frigate_segments.CFG.latitude)
     p.add_argument("--longitude", type=float, default=frigate_segments.CFG.longitude)
+    p.add_argument("--dawn-offset", type=int, default=0, metavar="MINUTES",
+                   help="Offset for dawn time in minutes. Positive = start later, negative = start earlier.")
+    p.add_argument("--dusk-offset", type=int, default=0, metavar="MINUTES",
+                   help="Offset for dusk time in minutes. Positive = end later, negative = end earlier. "
+                        "E.g., --dusk-offset -30 ends 30 minutes before dusk.")
 
     # output
     p.add_argument("--out-dir", default=CFG.out_dir)
@@ -602,7 +678,9 @@ def main():
         mode = 'dawntodusk' if args.dawntodusk else 'dusktodawn'
         sun_windows = compute_sun_windows(
             start_day, end_day, mode,
-            args.latitude, args.longitude, tz
+            args.latitude, args.longitude, tz,
+            dawn_offset=args.dawn_offset,
+            dusk_offset=args.dusk_offset
         )
         before_count = len(files_with_ts)
         files_with_ts = [(ts, p) for (ts, p) in files_with_ts if is_in_sun_windows(ts, sun_windows)]
