@@ -61,6 +61,9 @@ def parse_args():
 
     # disk
     p.add_argument("--recordings-path", default=frigate_sources.CFG.default_recordings_path)
+    p.add_argument("--recordings-path-fallback", action="append", default=[],
+                   help="Additional recordings paths to check (can be specified multiple times). "
+                        "Useful for multiple Frigate instances with NFS shares.")
     p.add_argument("--no-disk", action="store_true", default=False)
     p.add_argument("--source", choices=["disk", "vod"], default="disk",
                    help="Choose a single source (no fallback). Default: disk.")
@@ -432,6 +435,7 @@ def main():
         # Recordings folder structure is UTC-based; derive scan window from epoch seconds.
         start_utc = datetime.fromtimestamp(after, tz=utc)
         end_utc = datetime.fromtimestamp(before, tz=utc)
+        fallback = args.recordings_path_fallback if args.recordings_path_fallback else None
         disk_index, cadence, disk_err = frigate_sources.scan_index(
             args.recordings_path,
             args.camera,
@@ -440,6 +444,7 @@ def main():
             after,
             before,
             utc,
+            fallback_paths=fallback,
         )
         if not disk_index:
             print("Disk-only: no recordings found; falling back to VOD for all segments.")

@@ -40,6 +40,12 @@ python3 frigate_montage.py --source vod --camera TapoC560WS --dusktodawn --date 
 # Export with encode + progress.
 python3 frigate_montage.py --camera TapoC560WS --dusktodawn --date 2025-12-30 --encode --progress
 
+# Multiple Frigate instances (NFS shared recordings).
+python3 frigate_timelapse.py --camera TapoC325WS --start-date 2025-12-01 --days 30 \
+  --recordings-path /frigate1/recordings \
+  --recordings-path-fallback /mnt/frigate2/recordings \
+  --sample-interval 60 --encoder hevc_nvenc --fps 30
+
 Outputs (same base name as MP4)
 -------------------------------
 - Playlist preview: *.m3u
@@ -161,6 +167,7 @@ Troubleshooting
 - Check folder structure: `recordings/YYYY-MM-DD/HH/<camera>/MM.SS.mp4`
 - Recordings folder uses UTC timestamps, not local time.
 - Try `--source vod` to bypass disk and use VOD URLs directly.
+- Multiple Frigate servers? Use `--recordings-path-fallback /mnt/frigate2/recordings` (repeatable).
 
 ### ffmpeg errors
 - "Protocol not found": Add protocols to whitelist in `frigate_render.py` Config.

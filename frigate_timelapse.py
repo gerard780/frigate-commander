@@ -571,6 +571,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="Multi-day timelapse from Frigate disk recordings.")
     p.add_argument("--camera", required=True)
     p.add_argument("--recordings-path", default=frigate_sources.CFG.default_recordings_path)
+    p.add_argument("--recordings-path-fallback", action="append", default=[],
+                   help="Additional recordings paths to check (can be specified multiple times). "
+                        "Useful for multiple Frigate instances with NFS shares.")
     p.add_argument("--timezone", default=frigate_segments.CFG.timezone)
 
     # window selection
@@ -655,6 +658,7 @@ def main():
     start_utc = datetime.fromtimestamp(after, tz=utc)
     end_utc = datetime.fromtimestamp(before, tz=utc)
 
+    fallback = args.recordings_path_fallback if args.recordings_path_fallback else None
     disk_index, cadence, disk_err = frigate_sources.scan_index(
         args.recordings_path,
         args.camera,
@@ -663,6 +667,7 @@ def main():
         after,
         before,
         utc,
+        fallback_paths=fallback,
     )
     if not disk_index:
         raise SystemExit(disk_err or "no recordings found")

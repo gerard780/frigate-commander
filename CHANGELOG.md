@@ -16,6 +16,10 @@
 - Add `--no-browser` flag to YouTube upload for remote terminals.
   - Prints auth URL instead of opening browser.
   - User pastes redirect URL to complete OAuth flow.
+- Add `--recordings-path-fallback` for multiple Frigate instances.
+  - Can be specified multiple times (e.g., `--recordings-path-fallback /mnt/frigate2/recordings`).
+  - Merges files from all paths; primary path takes precedence for duplicate timestamps.
+  - Useful for NFS-shared recordings across servers.
 
 ## 2026-01-24
 ### Added

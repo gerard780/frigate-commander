@@ -83,13 +83,12 @@ def parse_filename_ts(base_name_no_ext: str, day_str: str, hour_str: str, tz: Zo
     return None
 
 
-def scan_index(recordings_root: str, camera: str, start_utc: datetime, end_utc: datetime, after_ts: int, before_ts: int, tz: ZoneInfo):
-    """
-    Build sorted list of (chunk_start_ts, file_path) for chunks likely overlapping the window.
-    """
+def _scan_single_path(recordings_root: str, camera: str, start_utc: datetime, end_utc: datetime,
+                      after_ts: int, before_ts: int, tz: ZoneInfo) -> List[Tuple[int, str]]:
+    """Scan a single recordings path for files in the time window."""
     recordings_root = expand_path(recordings_root)
     if not os.path.isdir(recordings_root):
-        return [], None, f"recordings path not found: {recordings_root}"
+        return []
 
     entries: List[Tuple[int, str]] = []
     for day_str, hour_str in iter_utc_hours(start_utc, end_utc):
@@ -108,9 +107,41 @@ def scan_index(recordings_root: str, camera: str, start_utc: datetime, end_utc: 
                 entries.append((ts, os.path.join(cam_dir, name)))
         except FileNotFoundError:
             continue
+    return entries
+
+
+def scan_index(recordings_root: str, camera: str, start_utc: datetime, end_utc: datetime,
+               after_ts: int, before_ts: int, tz: ZoneInfo,
+               fallback_paths: Optional[List[str]] = None):
+    """
+    Build sorted list of (chunk_start_ts, file_path) for chunks likely overlapping the window.
+
+    If fallback_paths is provided, also scans those paths and merges results.
+    Primary path takes precedence for duplicate timestamps.
+    """
+    entries = _scan_single_path(recordings_root, camera, start_utc, end_utc, after_ts, before_ts, tz)
+
+    # Track which timestamps we have from primary path
+    seen_ts = {ts for ts, _ in entries}
+    primary_count = len(entries)
+
+    # Scan fallback paths
+    fallback_count = 0
+    if fallback_paths:
+        for fb_path in fallback_paths:
+            fb_entries = _scan_single_path(fb_path, camera, start_utc, end_utc, after_ts, before_ts, tz)
+            for ts, path in fb_entries:
+                if ts not in seen_ts:
+                    entries.append((ts, path))
+                    seen_ts.add(ts)
+                    fallback_count += 1
 
     if not entries:
-        return [], None, "no recordings found in scanned folders"
+        paths_checked = [recordings_root] + (fallback_paths or [])
+        return [], None, f"no recordings found in: {', '.join(paths_checked)}"
+
+    if fallback_count > 0:
+        print(f"Disk scan: {primary_count} files from primary, {fallback_count} from fallback paths")
 
     entries.sort(key=lambda x: x[0])
 
@@ -179,6 +210,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="Resolve segments to disk files or VOD URLs.")
     p.add_argument("--segments-json", required=True, help="Path to JSON output from frigate_segments.py")
     p.add_argument("--recordings-path", default=CFG.default_recordings_path)
+    p.add_argument("--recordings-path-fallback", action="append", default=[],
+                   help="Additional recordings paths to check (can be specified multiple times). "
+                        "Useful for multiple Frigate instances with NFS shares.")
     p.add_argument("--no-disk", action="store_true", default=False)
     p.add_argument("--source", choices=["disk", "vod"], default="disk",
                    help="Choose a single source (no fallback). Default: disk.")
@@ -223,7 +257,11 @@ def main():
     cadence = None
     disk_err = None
     if args.source == "disk":
-        disk_index, cadence, disk_err = scan_index(args.recordings_path, camera, start_utc, end_utc, after, before, utc)
+        fallback = args.recordings_path_fallback if args.recordings_path_fallback else None
+        disk_index, cadence, disk_err = scan_index(
+            args.recordings_path, camera, start_utc, end_utc, after, before, utc,
+            fallback_paths=fallback
+        )
         if not disk_index:
             print("Disk-only: no recordings found; falling back to VOD for all segments.")
             args.source = "vod"
