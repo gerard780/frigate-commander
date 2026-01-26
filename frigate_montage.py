@@ -656,6 +656,7 @@ def main():
         copy_mode=copy_mode,
         copy_audio=copy_audio,
         timelapse=args.timelapse,
+        frame_sample=None,  # montage doesn't support frame sampling
         fps=args.fps,
         preset=args.preset,
         cq=args.cq,
