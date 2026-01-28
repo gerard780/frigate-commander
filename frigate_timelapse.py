@@ -114,6 +114,30 @@ def is_in_sun_windows(ts: int, windows: List[tuple]) -> bool:
     return False
 
 
+def generate_vod_segments(base_url: str, camera: str, after: int, before: int,
+                          sample_interval: float, sun_windows: Optional[List[tuple]] = None) -> List[tuple]:
+    """
+    Generate VOD URL segments for timelapse.
+
+    Returns list of (timestamp, vod_url) tuples, similar to disk_index format.
+    Each segment covers sample_interval seconds.
+    """
+    segments = []
+    current_ts = after
+
+    while current_ts < before:
+        # Check sun window filter if provided
+        if sun_windows is None or is_in_sun_windows(current_ts, sun_windows):
+            # Generate VOD URL for this chunk
+            chunk_end = min(current_ts + int(sample_interval), before)
+            url = frigate_sources.vod_url(base_url, camera, current_ts, chunk_end)
+            segments.append((current_ts, url))
+
+        current_ts += int(sample_interval)
+
+    return segments
+
+
 def _parse_cache_path_from_recording(file_path: str, cache_dir: str) -> Optional[str]:
     """
     Parse recording path to generate a timestamp-based cache path.
@@ -568,8 +592,12 @@ def build_ffmpeg_cmd(concat_path: str, out_mp4: str, *,
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Multi-day timelapse from Frigate disk recordings.")
+    p = argparse.ArgumentParser(description="Multi-day timelapse from Frigate recordings (disk or VOD).")
     p.add_argument("--camera", required=True)
+    p.add_argument("--base-url", default=frigate_segments.CFG.base_url,
+                   help="Frigate base URL (required for VOD source)")
+    p.add_argument("--source", choices=["disk", "vod"], default="disk",
+                   help="Recording source: disk (local files) or vod (stream from Frigate)")
     p.add_argument("--recordings-path", default=frigate_sources.CFG.default_recordings_path)
     p.add_argument("--recordings-path-fallback", action="append", default=[],
                    help="Additional recordings paths to check (can be specified multiple times). "
@@ -658,27 +686,9 @@ def main():
     start_utc = datetime.fromtimestamp(after, tz=utc)
     end_utc = datetime.fromtimestamp(before, tz=utc)
 
-    fallback = args.recordings_path_fallback if args.recordings_path_fallback else None
-    disk_index, cadence, disk_err = frigate_sources.scan_index(
-        args.recordings_path,
-        args.camera,
-        start_utc,
-        end_utc,
-        after,
-        before,
-        utc,
-        fallback_paths=fallback,
-    )
-    if not disk_index:
-        raise SystemExit(disk_err or "no recordings found")
-
-    # Filter files within time window
-    files_with_ts = [(ts, p) for (ts, p) in disk_index if after <= ts < before]
-    if not files_with_ts:
-        raise SystemExit("no recordings within requested window")
-
-    # For multi-day dawn/dusk windows, filter to only include valid sun periods
+    # Compute sun windows early (needed for both disk and VOD filtering)
     is_multiday = (end_day != start_day)
+    sun_windows = None
     if is_multiday and (args.dawntodusk or args.dusktodawn):
         mode = 'dawntodusk' if args.dawntodusk else 'dusktodawn'
         sun_windows = compute_sun_windows(
@@ -687,40 +697,92 @@ def main():
             dawn_offset=args.dawn_offset,
             dusk_offset=args.dusk_offset
         )
-        before_count = len(files_with_ts)
-        files_with_ts = [(ts, p) for (ts, p) in files_with_ts if is_in_sun_windows(ts, sun_windows)]
-        if not files_with_ts:
-            raise SystemExit(f"no recordings within {mode} windows")
-        print(f"Sun filter ({mode}): {len(files_with_ts)}/{before_count} files in {len(sun_windows)} windows")
 
-    # For segment-level sampling (--sample-interval), select files at intervals
-    if args.sample_interval is not None and args.sample_interval > 0:
-        interval = args.sample_interval
-        # Group files by which interval bucket they fall into (aligned to start time)
-        # This ensures larger intervals are always subsets of smaller ones
-        # e.g., 20s picks buckets 0,1,2,3,4,5... and 60s picks buckets 0,3,6...
-        buckets = {}
-        for ts, p in files_with_ts:
-            bucket = int((ts - after) // interval)
-            if bucket not in buckets:
-                buckets[bucket] = (ts, p)  # Keep first file in each bucket
-        # Sort by bucket and extract files
-        files = [p for bucket, (ts, p) in sorted(buckets.items())]
-        total_files = len(files_with_ts)
-        print(f"Segment sampling: {len(files)}/{total_files} files (1 per {args.sample_interval}s)")
+    # Source selection: disk or VOD
+    use_vod = (args.source == "vod")
+    cadence = None
+
+    if use_vod:
+        # VOD mode: generate URLs for time chunks
+        if args.sample_interval is None:
+            # Default to 60s chunks for VOD (required for efficient streaming)
+            effective_interval = 60.0
+            print(f"VOD mode: using default 60s sample interval")
+        else:
+            effective_interval = args.sample_interval
+
+        files_with_ts = generate_vod_segments(
+            args.base_url, args.camera, after, before,
+            effective_interval, sun_windows
+        )
+        if not files_with_ts:
+            raise SystemExit("no VOD segments generated")
+
+        cadence = effective_interval
+        files = [url for (ts, url) in files_with_ts]
+        print(f"VOD source: {len(files)} segments ({effective_interval}s each)")
+
     else:
-        files = [p for (ts, p) in files_with_ts]
+        # Disk mode: scan local recordings
+        fallback = args.recordings_path_fallback if args.recordings_path_fallback else None
+        disk_index, cadence, disk_err = frigate_sources.scan_index(
+            args.recordings_path,
+            args.camera,
+            start_utc,
+            end_utc,
+            after,
+            before,
+            utc,
+            fallback_paths=fallback,
+        )
+        if not disk_index:
+            raise SystemExit(disk_err or "no recordings found")
+
+        # Filter files within time window
+        files_with_ts = [(ts, p) for (ts, p) in disk_index if after <= ts < before]
+        if not files_with_ts:
+            raise SystemExit("no recordings within requested window")
+
+        # Apply sun window filter for disk mode
+        if sun_windows:
+            mode = 'dawntodusk' if args.dawntodusk else 'dusktodawn'
+            before_count = len(files_with_ts)
+            files_with_ts = [(ts, p) for (ts, p) in files_with_ts if is_in_sun_windows(ts, sun_windows)]
+            if not files_with_ts:
+                raise SystemExit(f"no recordings within {mode} windows")
+            print(f"Sun filter ({mode}): {len(files_with_ts)}/{before_count} files in {len(sun_windows)} windows")
+
+        # For segment-level sampling (--sample-interval), select files at intervals
+        if args.sample_interval is not None and args.sample_interval > 0:
+            interval = args.sample_interval
+            # Group files by which interval bucket they fall into (aligned to start time)
+            # This ensures larger intervals are always subsets of smaller ones
+            # e.g., 20s picks buckets 0,1,2,3,4,5... and 60s picks buckets 0,3,6...
+            buckets = {}
+            for ts, p in files_with_ts:
+                bucket = int((ts - after) // interval)
+                if bucket not in buckets:
+                    buckets[bucket] = (ts, p)  # Keep first file in each bucket
+            # Sort by bucket and extract files
+            files = [p for bucket, (ts, p) in sorted(buckets.items())]
+            total_files = len(files_with_ts)
+            print(f"Segment sampling: {len(files)}/{total_files} files (1 per {args.sample_interval}s)")
+        else:
+            files = [p for (ts, p) in files_with_ts]
 
     if not files:
         raise SystemExit("no files after sampling filter")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Default frame cache to {out_dir}/frame_cache when using --sample-interval
+    # Default frame cache to {out_dir}/frame_cache when using --sample-interval (disk only)
     frame_cache = args.frame_cache
-    if args.sample_interval is not None and not args.no_frame_cache:
+    if args.sample_interval is not None and not args.no_frame_cache and not use_vod:
         if frame_cache is None:
             frame_cache = os.path.join(args.out_dir, "frame_cache")
+    # Disable frame cache for VOD (streams can't be cached the same way)
+    if use_vod:
+        frame_cache = None
     concat_path = frigate_render.write_concat_file(args.out_dir, args.camera, build_concat_entries(files))
 
     base_label = start_day.isoformat()
@@ -818,8 +880,10 @@ def main():
         estimate_line = f"Estimate: {format_duration(output_seconds)} (size unknown; set --estimate-bitrate)"
 
     print(f"Camera:  {args.camera}")
+    print(f"Source:  {'VOD' if use_vod else 'disk'}")
     print(f"Window:  {start_local.isoformat()} -> {end_local.isoformat()} ({window_tag})")
-    print(f"Files:   {len(files)} cadence≈{cadence}s")
+    source_label = "URLs" if use_vod else "files"
+    print(f"Files:   {len(files)} {source_label} cadence≈{cadence}s")
     print(f"Output:  {out_mp4}")
     if args.sample_interval is not None:
         print(f"Codec:   {args.encoder} preset={preset} sample-interval={args.sample_interval}s fps={args.fps}")
@@ -840,8 +904,9 @@ def main():
         print("AQ:      " + ", ".join(aq_bits))
     print(estimate_line)
 
-    # Use two-pass approach for sample_interval (MUCH faster)
-    if args.sample_interval is not None:
+    # Use two-pass approach for sample_interval or VOD (MUCH faster)
+    # VOD always uses this approach since segments are pre-chunked
+    if args.sample_interval is not None or use_vod:
         # Create temp directory for frame extraction
         tmp_dir = tempfile.mkdtemp(prefix="timelapse_frames_")
         try:

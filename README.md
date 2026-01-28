@@ -17,6 +17,30 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements.txt
 
+Web UI (Optional)
+-----------------
+A full web interface is available for managing jobs without the command line.
+
+# Install web dependencies
+cd web && npm install && cd ..
+
+# Start API backend + web dev server
+./start.sh
+
+# Or run separately:
+# Terminal 1: uvicorn api.main:app --reload --port 8000
+# Terminal 2: cd web && npm run dev
+
+Open http://localhost:5173 in your browser.
+
+Features:
+- Create montage/timelapse jobs with all CLI options
+- Real-time progress monitoring
+- Output file browser with video playback
+- Preset system for saving job configurations
+- YouTube upload integration
+- Settings for default camera, encoder, paths
+
 Quick Start: Animal Montage
 ---------------------------
 # Dawntodusk for a single day.

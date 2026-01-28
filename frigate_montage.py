@@ -58,6 +58,11 @@ def parse_args():
                    help="Comma-separated labels to include (replaces default animal list).")
     p.add_argument("--labels-exclude", default=None,
                    help="Comma-separated labels to exclude (adds to default exclusions).")
+    p.add_argument("--all-motion", action="store_true", default=False,
+                   help="Capture all motion events regardless of detection labels. Uses /api/review instead of /api/events.")
+    p.add_argument("--min-motion", type=int, default=0,
+                   help="Minimum motion frames per segment (from Frigate's recording stats). "
+                        "Higher values filter out low-activity segments. Only works with --all-motion.")
 
     # disk
     p.add_argument("--recordings-path", default=frigate_sources.CFG.default_recordings_path)
@@ -346,11 +351,20 @@ def main():
     after, before, start_local, end_local, window_tag, start_day, end_day = frigate_segments.compute_window(args, tz)
 
     try:
-        events = frigate_segments.api_get(
-            args.base_url, "/api/events",
-            params={"camera": args.camera, "after": after, "before": before, "limit": 5000},
-            headers=frigate_segments.CFG.headers
-        )
+        if args.all_motion:
+            # Use /api/review for all motion events (with or without detections)
+            events = frigate_segments.api_get(
+                args.base_url, "/api/review",
+                params={"cameras": args.camera, "after": after, "before": before, "limit": 5000},
+                headers=frigate_segments.CFG.headers
+            )
+        else:
+            # Use /api/events for detection events only
+            events = frigate_segments.api_get(
+                args.base_url, "/api/events",
+                params={"camera": args.camera, "after": after, "before": before, "limit": 5000},
+                headers=frigate_segments.CFG.headers
+            )
     except ApiError as e:
         # Clean error message instead of stack trace
         print(f"Error: Could not connect to Frigate at {args.base_url}")
@@ -358,7 +372,8 @@ def main():
         print(f"  Details: {e}")
         raise SystemExit(1)
     if not isinstance(events, list):
-        raise SystemExit(f"Unexpected /api/events response: {type(events)}")
+        endpoint = "/api/review" if args.all_motion else "/api/events"
+        raise SystemExit(f"Unexpected {endpoint} response: {type(events)}")
 
     # Parse label filter overrides
     include_labels = None
@@ -369,20 +384,69 @@ def main():
         exclude_labels = frigate_segments.CFG.exclude_labels | {l.strip() for l in args.labels_exclude.split(",") if l.strip()}
 
     filtered = []
-    for ev in events:
-        label = ev.get("label")
-        if not label or not isinstance(label, str):
-            continue
-        score = float(ev.get("top_score") or ev.get("score") or 0.0)
-        if score < float(args.min_score):
-            continue
-        if frigate_segments.label_is_animal(label, include_labels=include_labels, exclude_labels=exclude_labels):
+    if args.all_motion:
+        # For all-motion mode, include all review items with start_time in range
+        for ev in events:
+            st = ev.get("start_time")
+            if st is None:
+                continue
+            # Filter by time window (review API may return items outside range)
+            if float(st) < float(after) or float(st) > float(before):
+                continue
             filtered.append(ev)
+    else:
+        # Standard detection-based filtering
+        for ev in events:
+            label = ev.get("label")
+            if not label or not isinstance(label, str):
+                continue
+            score = float(ev.get("top_score") or ev.get("score") or 0.0)
+            if score < float(args.min_score):
+                continue
+            if frigate_segments.label_is_animal(label, include_labels=include_labels, exclude_labels=exclude_labels):
+                filtered.append(ev)
 
     raw_segments = frigate_segments.build_segments_from_events(
         filtered, after, before, args.pre_pad, args.post_pad, args.min_segment_len
     )
     merged = frigate_segments.merge_segments(raw_segments, args.merge_gap)
+
+    # Filter by motion intensity if requested (only in all-motion mode)
+    if args.all_motion and args.min_motion > 0 and merged:
+        try:
+            # Fetch recording segments with motion data
+            recordings = frigate_segments.api_get(
+                args.base_url, f"/api/{args.camera}/recordings",
+                params={"after": after, "before": before},
+                headers=frigate_segments.CFG.headers
+            )
+            if isinstance(recordings, list):
+                # Build a lookup of motion values by time range
+                motion_data = []
+                for rec in recordings:
+                    rec_start = rec.get("start_time")
+                    rec_end = rec.get("end_time")
+                    rec_motion = rec.get("motion", 0) or 0
+                    if rec_start is not None and rec_end is not None:
+                        motion_data.append((float(rec_start), float(rec_end), int(rec_motion)))
+
+                # Filter segments by motion threshold
+                motion_filtered = []
+                for seg_start, seg_end in merged:
+                    # Sum motion frames from overlapping recording segments
+                    total_motion = 0
+                    for rec_start, rec_end, rec_motion in motion_data:
+                        # Check for overlap
+                        if rec_end >= seg_start and rec_start <= seg_end:
+                            total_motion += rec_motion
+                    if total_motion >= args.min_motion:
+                        motion_filtered.append((seg_start, seg_end))
+
+                before_count = len(merged)
+                merged = motion_filtered
+                print(f"Motion filter: {before_count} -> {len(merged)} segments (min_motion={args.min_motion})")
+        except Exception as e:
+            print(f"Warning: Could not fetch motion data for filtering: {e}")
 
     # Handle empty segments case
     if not merged:
@@ -535,7 +599,8 @@ def main():
     base_label = segdoc["base_day"]
     if segdoc.get("base_day_end") and segdoc["base_day_end"] != segdoc["base_day"]:
         base_label = f"{segdoc['base_day']}_to_{segdoc['base_day_end']}"
-    out_mp4 = args.out_file or os.path.join(args.out_dir, f"{args.camera}-animals-{base_label}-{suffix}.mp4")
+    mode_label = "motion" if args.all_motion else "animals"
+    out_mp4 = args.out_file or os.path.join(args.out_dir, f"{args.camera}-{mode_label}-{base_label}-{suffix}.mp4")
 
     base_stem = os.path.splitext(out_mp4)[0]
     segments_path = f"{base_stem}.segments.json"

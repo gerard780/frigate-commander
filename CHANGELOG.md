@@ -4,6 +4,54 @@
 # Format based on Keep a Changelog:
 # https://keepachangelog.com/en/1.1.0/
 
+## 2026-01-27
+### Added
+- **Web UI** - Full React-based web interface for managing jobs
+  - Job creation with presets, date ranges, and all CLI options
+  - Real-time job progress monitoring with WebSocket updates
+  - Output file browser with video playback and thumbnails
+  - Settings page for default configuration
+  - Dark-themed Frigate-inspired design
+
+- **API Backend** - FastAPI-based REST API
+  - Job management: create, list, cancel, retry, clone
+  - File management: list, download, delete, thumbnails
+  - Preset system: save, load, edit, delete job configurations
+  - Config management: persist default settings
+  - Health check and camera listing endpoints
+
+- **YouTube Integration**
+  - Multi-account support with `/api/youtube/accounts` endpoint
+  - Account selector in upload modal (when multiple accounts exist)
+  - Add `--token-file` argument to `youtube_upload.py` for account selection
+
+- **Montage Enhancements**
+  - Add `--all-motion` flag to capture all motion events (ignores detection labels)
+    - Uses Frigate's `/api/review` endpoint instead of `/api/events`
+    - Output files labeled as `{camera}-motion-...` instead of `{camera}-animals-...`
+  - Add `--min-motion` for motion intensity filtering
+    - Queries Frigate's `/api/{camera}/recordings` for motion frame counts
+    - Filters segments below threshold (e.g., `--min-motion 50`)
+  - Add `--min-score` support for detection confidence filtering
+  - Add `--labels-exclude` support in web UI
+  - Add `--start-time` and `--end-time` for custom time windows
+  - Add copy-only mode toggle (skip re-encoding)
+
+- **Timelapse Enhancements**
+  - Add dawn/dusk offset controls in web UI
+  - Add CQ (NVENC) and CRF (software) quality settings in web UI
+  - Add CUDA toggle for GPU-accelerated frame extraction
+
+- **Preset System**
+  - Save job configurations as reusable presets
+  - Edit preset names via Settings page
+  - Delete presets with confirmation
+  - Load presets in job creation form
+
+### Changed
+- Restructured project with `api/` and `web/` directories
+- Added `start.sh` script for running API + web dev server
+
 ## 2026-01-25
 ### Added
 - Add `--dawn-offset` and `--dusk-offset` to adjust sun times by minutes.
